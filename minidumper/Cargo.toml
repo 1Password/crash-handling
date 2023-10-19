@@ -24,7 +24,7 @@ libc = "0.2"
 # Basic log emitting
 log = "0.4"
 # Minidump writing
-minidump-writer = "0.8"
+minidump-writer = { git = "https://github.com/1Password/minidump-writer.git", branch = "windows_minidump_to_memory" }
 # Event loop
 polling = "2.2"
 # Nicer locking primitives

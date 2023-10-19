@@ -1,7 +1,7 @@
 use super::{Connection, Header, Listener, SocketName};
 use crate::{Error, LoopAction};
 use polling::{Event, Poller};
-use std::io::ErrorKind;
+use std::io::{Cursor, ErrorKind, Write};
 use std::time::{Duration, Instant};
 
 /// Server side of the connection, which runs in the monitor process that is
@@ -396,7 +396,9 @@ impl Server {
         crash_context: crash_context::CrashContext,
         handler: &dyn crate::ServerHandler,
     ) -> Result<LoopAction, Error> {
-        let (mut minidump_file, minidump_path) = handler.create_minidump_file()?;
+        let (mut minidump_hard_file, minidump_path) = handler.create_minidump_file()?.unzip();
+        #[cfg(not(target_os = "windows"))]
+        let mut minidump_file: Cursor<Vec<u8>> = Cursor::new(Vec::new());
 
         cfg_if::cfg_if! {
             if #[cfg(any(target_os = "linux", target_os = "android"))] {
@@ -409,26 +411,38 @@ impl Server {
                 // same location in memory, unfortunately it's a bit hard to communicate this through so
                 // many layers, so really, we are falling back on Windows to actually correctly handle
                 // if the interior pointers have become invalid which it should? do ok with
-                let result =
-                    minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(crash_context, None, &mut minidump_file);
+                let mut result =
+                    minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(crash_context, None);
             } else if #[cfg(target_os = "macos")] {
                 let mut writer = minidump_writer::minidump_writer::MinidumpWriter::with_crash_context(crash_context);
             }
         }
-
         #[cfg(not(target_os = "windows"))]
         let result = writer.dump(&mut minidump_file);
-
+        if let Some(minidump_hard_file) = minidump_hard_file.as_mut() {
+            #[cfg(not(target_os = "windows"))]
+            {
+                let buffer = &minidump_file.clone().into_inner();
+                minidump_hard_file.write_all(buffer).unwrap();
+                minidump_hard_file.flush().unwrap();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                result = result.and_then(
+                    |buffer| -> Result<Vec<u8>, minidump_writer::errors::Error> {
+                        minidump_hard_file.write_all(&buffer)?;
+                        Ok(buffer)
+                    },
+                );
+            }
+        }
         // Notify the user handler about the minidump, even if we failed to write it
         Ok(handler.on_minidump_created(
             result
-                .map(|_contents| crate::MinidumpBinary {
-                    file: minidump_file,
+                .map(|contents| crate::MinidumpBinary {
+                    file: minidump_hard_file,
                     path: minidump_path,
-                    #[cfg(target_os = "windows")]
-                    contents: None,
-                    #[cfg(not(target_os = "windows"))]
-                    contents: Some(_contents),
+                    contents: contents,
                 })
                 .map_err(crate::Error::from),
         ))

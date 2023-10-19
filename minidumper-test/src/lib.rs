@@ -115,14 +115,14 @@ pub fn spinup_server(id: &str, dump_path: Option<PathBuf>) -> Server {
     }
 
     impl minidumper::ServerHandler for Inner {
-        fn create_minidump_file(&self) -> Result<(std::fs::File, PathBuf), std::io::Error> {
+        fn create_minidump_file(&self) -> Result<Option<(std::fs::File, PathBuf)>, std::io::Error> {
             if !self.dump_path.parent().unwrap().exists() {
                 let _ = std::fs::create_dir_all(self.dump_path.parent().unwrap());
             }
 
             let file = std::fs::File::create(&self.dump_path)?;
 
-            Ok((file, self.dump_path.clone()))
+            Ok(Some((file, self.dump_path.clone())))
         }
 
         fn on_minidump_created(
@@ -130,17 +130,16 @@ pub fn spinup_server(id: &str, dump_path: Option<PathBuf>) -> Server {
             result: Result<minidumper::MinidumpBinary, minidumper::Error>,
         ) -> minidumper::LoopAction {
             let md_bin = result.expect("failed to write minidump");
-            md_bin
-                .file
-                .sync_all()
-                .expect("failed to flush minidump file");
-
-            self.dump_tx
-                .lock()
-                .expect("unable to acquire lock")
-                .send(md_bin.path)
-                .expect("couldn't send minidump path");
-
+            if let Some(file) = md_bin.file {
+                file.sync_all().expect("failed to flush minidump file");
+            }
+            if let Some(path) = md_bin.path {
+                self.dump_tx
+                    .lock()
+                    .expect("unable to acquire lock")
+                    .send(path)
+                    .expect("couldn't send minidump path");
+            }
             minidumper::LoopAction::Continue
         }
 

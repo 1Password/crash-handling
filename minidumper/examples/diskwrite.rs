@@ -16,7 +16,7 @@ fn main() {
             /// created to store it.
             fn create_minidump_file(
                 &self,
-            ) -> Result<(std::fs::File, std::path::PathBuf), std::io::Error> {
+            ) -> Result<Option<(std::fs::File, std::path::PathBuf)>, std::io::Error> {
                 let uuid = uuid::Uuid::new_v4();
 
                 let dump_path = std::path::PathBuf::from(format!("dumps/{uuid}.dmp"));
@@ -27,7 +27,7 @@ fn main() {
                     }
                 }
                 let file = std::fs::File::create(&dump_path)?;
-                Ok((file, dump_path))
+                Ok(Some((file, dump_path)))
             }
 
             /// Called when a crash has been fully written as a minidump to the provided
@@ -37,10 +37,12 @@ fn main() {
                 result: Result<minidumper::MinidumpBinary, minidumper::Error>,
             ) -> minidumper::LoopAction {
                 match result {
-                    Ok(mut md_bin) => {
+                    Ok(md_bin) => {
                         use std::io::Write;
-                        let _ = md_bin.file.flush();
-                        log::info!("wrote minidump to disk");
+                        if let Some(mut file) = md_bin.file {
+                            let _ = file.flush();
+                            log::info!("wrote minidump to disk");
+                        }
                     }
                     Err(e) => {
                         log::error!("failed to write minidump: {:#}", e);
