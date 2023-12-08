@@ -416,7 +416,7 @@ impl Server {
                 // many layers, so really, we are falling back on Windows to actually correctly handle
                 // if the interior pointers have become invalid which it should? do ok with
                 let mut result =
-                    minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(crash_context, None);
+                    minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(crash_context, None, None);
             } else if #[cfg(target_os = "macos")] {
                 let mut writer = minidump_writer::minidump_writer::MinidumpWriter::with_crash_context(crash_context);
             }
