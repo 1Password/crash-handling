@@ -176,7 +176,7 @@ impl Server {
             }
 
             events.clear();
-            let timeout = Duration::from_millis(10);
+            let timeout = Duration::from_millis(200);
             let deadline = Instant::now() + timeout;
             let mut remaining = Some(timeout);
             while let Some(timeout) = remaining {
