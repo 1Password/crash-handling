@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+## [0.6.3] - 2024-07-25
+### Fixed
+- [PR#89](https://github.com/EmbarkStudios/crash-handling/pull/89) fixed compilation for `arm-unknown-linux-gnueabihf`...again.
+
+## [0.6.2] - 2024-06-08
+### Changed
+- Update MSRV to 1.62.0
+
 ## [0.6.1] - 2023-06-19
 ### Added
 - [PR#76](https://github.com/EmbarkStudios/crash-handling/pull/76) added support for `i686-linux-android` and `x86_64-linux-android`. Thanks [@gabrielesvelto](https://github.com/gabrielesvelto)!
@@ -68,7 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial pass of crash-context, Linux only
 
 <!-- next-url -->
-[Unreleased]: https://github.com/EmbarkStudios/crash-handling/compare/crash-context-0.6.1...HEAD
+[Unreleased]: https://github.com/EmbarkStudios/crash-handling/compare/{{tag_name}}...HEAD
+[0.6.3]: https://github.com/EmbarkStudios/crash-handling/compare/crash-context-0.6.2...{{tag_name}}
+[0.6.2]: https://github.com/EmbarkStudios/crash-handling/compare/crash-context-0.6.1...crash-context-0.6.2
 [0.6.1]: https://github.com/EmbarkStudios/crash-handling/compare/crash-context-0.6.0...crash-context-0.6.1
 [0.6.0]: https://github.com/EmbarkStudios/crash-handling/compare/crash-context-0.5.1...crash-context-0.6.0
 [0.5.1]: https://github.com/EmbarkStudios/crash-handling/compare/crash-context-0.5.0...crash-context-0.5.1

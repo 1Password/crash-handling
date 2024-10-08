@@ -1,6 +1,6 @@
 [package]
 name = "minidumper"
-version = "0.8.0"
+version = "0.8.3"
 description = "IPC impl for creating a minidump for a crashed process"
 repository = "https://github.com/EmbarkStudios/crash-handling"
 authors = [
@@ -18,31 +18,31 @@ keywords = ["crash", "minidump", "ipc", "out-of-process"]
 
 [dependencies]
 # Nicer cfg handling
-cfg-if = "1.0"
-crash-context = "0.6"
-libc = "0.2"
+cfg-if.workspace = true
+crash-context.workspace = true
+libc.workspace = true
 # Basic log emitting
 log = "0.4"
 # Minidump writing
 minidump-writer = { git = "https://github.com/1Password/minidump-writer.git", branch = "windows_minidump_to_memory" }
 # Event loop
-polling = "2.2"
+polling = "3.2"
 # Nicer locking primitives
-parking_lot = "0.12"
+parking_lot.workspace = true
 # Nicer error creation
 thiserror = "1.0"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 # Improved Unix domain socket support, includes features that are not available in std
-uds = "0.2.6"
+uds = "0.4"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
-# Nicer binary interop
-scroll = "0.11"
+# Nicer binary interop, keep aligned with minidump-writer
+scroll = { version = "0.12", features = ["derive"] }
 
 [dev-dependencies]
 # Diskwrite example
 crash-handler = { path = "../crash-handler" }
-pretty_env_logger = "0.4.0"
+pretty_env_logger = "0.5.0"
 # uuid generation
 uuid = { version = "1.0", features = ["v4"] }

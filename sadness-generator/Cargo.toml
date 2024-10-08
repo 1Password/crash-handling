@@ -1,6 +1,6 @@
 [package]
 name = "sadness-generator"
-version = "0.5.0"
+version = "0.6.0"
 description = "Provides various ways to make your program sad"
 repository = "https://github.com/EmbarkStudios/crash-handling"
 authors = [
@@ -15,8 +15,8 @@ homepage = "https://github.com/EmbarkStudios/crash-handling/tree/main/sadness-ge
 # so we use simulation, the simulation is so good it's real!
 categories = ["simulation"]
 keywords = ["crash", "sadness", "signal", "exception"]
-# We use `asm!`
-rust-version = "1.59.0"
+# We use `asm!` and rawdylib Windows bindings
+rust-version = "1.71.0"
 
 [dependencies]
-libc = "0.2"
+libc.workspace = true

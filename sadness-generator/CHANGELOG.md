@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+## [0.6.0] - 2024-06-08
+### Changed
+- Update MSRV to 1.62.0
+
 ## [0.5.0] - 2022-11-17
 ### Changed
 - [PR#63](https://github.com/EmbarkStudios/crash-handling/pull/63) added `SadnessFlavor::Abort` to Windows, and `raise_abort` now uses `libc::abort` instead of `std::process::abort` to have consistent behavior between all targets.
@@ -53,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial pass of crash-context, Linux only
 
 <!-- next-url -->
-[Unreleased]: https://github.com/EmbarkStudios/crash-handling/compare/sadness-generator-0.5.0...HEAD
+[Unreleased]: https://github.com/EmbarkStudios/crash-handling/compare/sadness-generator-0.6.0...HEAD
+[0.6.0]: https://github.com/EmbarkStudios/crash-handling/compare/sadness-generator-0.5.0...sadness-generator-0.6.0
 [0.5.0]: https://github.com/EmbarkStudios/crash-handling/compare/sadness-generator-0.4.2...sadness-generator-0.5.0
 [0.4.2]: https://github.com/EmbarkStudios/crash-handling/compare/sadness-generator-0.4.1...sadness-generator-0.4.2
 [0.4.1]: https://github.com/EmbarkStudios/crash-handling/compare/sadness-generator-0.4.0...sadness-generator-0.4.1

@@ -65,23 +65,25 @@ pub extern "C" fn pthread_create(
     // Finds the real pthread_create and specifies the pthread_key that is
     // used to uninstall and unmap the alternate stack
     INIT.call_once(|| unsafe {
-        let ptr;
-
-        #[cfg(target_env = "musl")]
-        {
-            ptr = __pthread_create as *const c_void;
-        }
-        #[cfg(not(target_env = "musl"))]
-        {
-            const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
-            ptr = libc::dlsym(RTLD_NEXT, b"pthread_create\0".as_ptr().cast());
+        cfg_if::cfg_if! {
+            if #[cfg(target_env = "musl")] {
+                let ptr = __pthread_create as *mut c_void;
+            } else {
+                const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
+                let ptr = libc::dlsym(RTLD_NEXT, b"pthread_create\0".as_ptr().cast());
+            }
         }
 
         if !ptr.is_null() {
-            REAL_PTHREAD_CREATE = Some(std::mem::transmute(ptr));
+            REAL_PTHREAD_CREATE = Some(std::mem::transmute::<*mut libc::c_void, pthread_create_t>(
+                ptr,
+            ));
         }
 
-        libc::pthread_key_create(&mut THREAD_DESTRUCTOR_KEY, Some(uninstall_sig_alt_stack));
+        libc::pthread_key_create(
+            std::ptr::addr_of_mut!(THREAD_DESTRUCTOR_KEY),
+            Some(uninstall_sig_alt_stack),
+        );
     });
 
     let real_pthread_create = unsafe { REAL_PTHREAD_CREATE.as_ref() }.expect("pthread_create() intercept failed but the intercept function is still being called, this won't work");

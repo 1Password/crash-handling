@@ -242,7 +242,10 @@ pub unsafe fn install_handlers() {
 
     // Everything is initialized. Transmute the array to the
     // initialized type.
-    *ohl = Some(mem::transmute::<_, [libc::sigaction; 6]>(old_handlers));
+    *ohl = Some(mem::transmute::<
+        [std::mem::MaybeUninit<libc::sigaction>; 6],
+        [libc::sigaction; 6],
+    >(old_handlers));
 }
 
 pub(super) fn attach(on_crash: Box<dyn crate::CrashEvent>) -> Result<(), Error> {
@@ -334,7 +337,7 @@ unsafe extern "C" fn signal_handler(
         let handler = HANDLER.lock();
 
         if let Some(handler) = &*handler {
-            match handler.handle_signal(sig as i32, info, uc) {
+            match handler.handle_signal(info, uc) {
                 crate::CrashEventResult::Handled(true) => Action::RestoreDefault,
                 crate::CrashEventResult::Handled(false) => Action::RestorePrevious,
                 crate::CrashEventResult::Jump { jmp_buf, value } => Action::Jump((jmp_buf, value)),
@@ -406,7 +409,6 @@ impl HandlerInner {
 
     pub(super) unsafe fn handle_signal(
         &self,
-        _sig: libc::c_int,
         info: &mut libc::siginfo_t,
         uc: &mut libc::c_void,
     ) -> crate::CrashEventResult {
@@ -421,7 +423,7 @@ impl HandlerInner {
 
         {
             *crash_ctx = mem::MaybeUninit::zeroed();
-            let mut cc = &mut *crash_ctx.as_mut_ptr();
+            let cc = &mut *crash_ctx.as_mut_ptr();
 
             ptr::copy_nonoverlapping(nix_info, &mut cc.siginfo, 1);
 
