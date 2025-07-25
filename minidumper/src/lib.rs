@@ -10,12 +10,12 @@ pub use ipc::{Client, Server};
 
 /// The result of a successful minidump generation.
 pub struct MinidumpBinary {
-    /// The file the minidump was written to, as provided by [`ServerHandler::create_minidump_file`]
-    pub file: File,
-    /// The path to the file as provided by [`ServerHandler::create_minidump_file`].
-    pub path: PathBuf,
-    /// The in-memory contents of the minidump, if available
-    pub contents: Option<Vec<u8>>,
+    /// The file the minidump was written to, as provided by [`ServerHandler::create_minidump_file`], if available
+    pub file: Option<File>,
+    /// The path to the file as provided by [`ServerHandler::create_minidump_file`], if available
+    pub path: Option<PathBuf>,
+    /// The in-memory contents of the minidump
+    pub contents: Vec<u8>,
 }
 
 /// Actions for the [`Server`] message loop to take after a [`ServerHandler`]
@@ -33,7 +33,7 @@ pub enum LoopAction {
 pub trait ServerHandler: Send + Sync {
     /// Called when a crash request has been received and a backing file needs
     /// to be created to store it.
-    fn create_minidump_file(&self) -> Result<(File, PathBuf), std::io::Error>;
+    fn create_minidump_file(&self) -> Result<Option<(File, PathBuf)>, std::io::Error>;
     /// Called when a crash has been fully written as a minidump to the provided
     /// file. Also returns the full heap buffer as well.
     ///

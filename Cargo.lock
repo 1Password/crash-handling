@@ -460,21 +460,6 @@ dependencies = [
 
 [[package]]
 name = "minidump-common"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dad3a7b1bd550c5f6f181b6b0fee6794f81aef6809e71467a6170ac2c0107b7"
-dependencies = [
- "bitflags",
- "debugid",
- "num-derive",
- "num-traits",
- "range-map",
- "scroll",
- "smart-default",
-]
-
-[[package]]
-name = "minidump-common"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf2f8b9bdd2449be3456faf1a2fb16317209564701c7a4f64b1e3e8848a02ccb"
@@ -489,10 +474,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "minidump-common"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd1e7ee92185b2f4fa67c3e5c1743057d979e145f58b4391d5481b79f0d8067c"
+dependencies = [
+ "bitflags",
+ "debugid",
+ "num-derive",
+ "num-traits",
+ "range-map",
+ "scroll",
+ "smart-default",
+]
+
+[[package]]
 name = "minidump-writer"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e9370e1f326cb4385f78355d8a0f68f429e9002fd3ca53fff9b43fded234473"
+source = "git+https://github.com/1Password/minidump-writer.git?branch=windows-minidump-to-memory-callback#ce1f6f874fdc39024fd8da2fdf3c3acc480b50a6"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -506,7 +505,7 @@ dependencies = [
  "mach2",
  "memmap2",
  "memoffset",
- "minidump-common 0.24.1",
+ "minidump-common 0.26.0",
  "nix",
  "procfs-core",
  "scroll",
@@ -866,9 +865,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.140"
+version = "1.0.141"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20068b6e96dc6c9bd23e01df8827e6c7e1f2fddd43c21810382803c136b99373"
+checksum = "30b9eff21ebe718216c6ec64e1d9ac57087aad11efc64e32002bce4a0d4c03d3"
 dependencies = [
  "itoa",
  "memchr",

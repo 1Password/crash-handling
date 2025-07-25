@@ -24,7 +24,7 @@ libc.workspace = true
 # Basic log emitting
 log = "0.4"
 # Minidump writing
-minidump-writer = "0.10"
+minidump-writer = { git = "https://github.com/1Password/minidump-writer.git", branch = "windows-minidump-to-memory-callback" }
 # Event loop
 polling = "3.2"
 # Nicer locking primitives

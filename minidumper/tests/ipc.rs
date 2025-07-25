@@ -19,7 +19,7 @@ fn ipc_messages() {
     impl minidumper::ServerHandler for Server {
         fn create_minidump_file(
             &self,
-        ) -> Result<(std::fs::File, std::path::PathBuf), std::io::Error> {
+        ) -> Result<Option<(std::fs::File, std::path::PathBuf)>, std::io::Error> {
             panic!("should not be called");
         }
 
@@ -88,7 +88,7 @@ fn inactive_reap() {
     impl minidumper::ServerHandler for Server {
         fn create_minidump_file(
             &self,
-        ) -> Result<(std::fs::File, std::path::PathBuf), std::io::Error> {
+        ) -> Result<Option<(std::fs::File, std::path::PathBuf)>, std::io::Error> {
             panic!("should not be called");
         }
 
@@ -175,7 +175,7 @@ fn ping() {
     impl minidumper::ServerHandler for Server {
         fn create_minidump_file(
             &self,
-        ) -> Result<(std::fs::File, std::path::PathBuf), std::io::Error> {
+        ) -> Result<Option<(std::fs::File, std::path::PathBuf)>, std::io::Error> {
             panic!("should not be called");
         }
 
