@@ -398,6 +398,46 @@ pub(super) struct HandlerInner {
     pub(super) dump_process: Option<u32>,
 }
 
+/// Translate a signal-handler `siginfo_t` into a `signalfd_siginfo`.
+fn siginfo_to_signalfd(info: &libc::siginfo_t) -> libc::signalfd_siginfo {
+    // SAFETY: signalfd_siginfo is not a reference, contains no references,
+    // and is comprised entirely of zeroable fields
+    let mut sfd: libc::signalfd_siginfo = unsafe { mem::zeroed() };
+
+    sfd.ssi_signo = info.si_signo as u32;
+    sfd.ssi_errno = info.si_errno;
+    sfd.ssi_code = info.si_code;
+
+    if info.si_code <= 0 {
+        // Sent by a process: SI_USER (0) / SI_QUEUE (-1) / SI_TKILL (-6) / ...
+        // Carries sender pid/uid + sigval, NOT a fault address. This is the
+        // abort()/raise()/kill() path (std::process::abort()).
+        // SAFETY: si_pid exists if si_code <= 0
+        sfd.ssi_pid = unsafe { info.si_pid() } as u32;
+        // SAFETY: si_uid exists if si_code <= 0
+        sfd.ssi_uid = unsafe { info.si_uid() };
+        // sigval overlaps ssi_ptr/ssi_int in the union; libc only exposes the
+        // pointer form, so derive the int from its low bits.
+        // SAFETY: si_value exists if si_code <= 0
+        let sival_ptr = unsafe { info.si_value() }.sival_ptr as u64;
+        sfd.ssi_ptr = sival_ptr;
+        sfd.ssi_int = sival_ptr as i32;
+    } else {
+        // Kernel-generated (si_code > 0, e.g. SEGV_MAPERR, TRAP_BRKPT, SI_KERNEL).
+        // For the hardware-fault signals we install, the payload is si_addr.
+        // See https://www.man7.org/linux/man-pages/man2/sigaction.2.html
+        match info.si_signo {
+            libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGTRAP => {
+                // SAFETY: si_addr is set by the above signal sources
+                sfd.ssi_addr = unsafe { info.si_addr() } as u64;
+            }
+            _ => {}
+        }
+    }
+
+    sfd
+}
+
 impl HandlerInner {
     #[inline]
     pub(super) fn new(handler: Box<dyn crate::CrashEvent>) -> Self {
@@ -412,11 +452,6 @@ impl HandlerInner {
         info: &mut libc::siginfo_t,
         uc: &mut libc::c_void,
     ) -> crate::CrashEventResult {
-        // The siginfo_t in libc is lowest common denominator, but this code is
-        // specifically targeting linux/android, which contains the si_pid field
-        // that we require
-        let nix_info = &*((info as *const libc::siginfo_t).cast::<libc::signalfd_siginfo>());
-
         // Allow ourselves to be dumped, if that is what the user handler wishes to do
         let _set_dumpable = SetDumpable::new(self.dump_process);
         let mut crash_ctx = CRASH_CONTEXT.lock();
@@ -425,7 +460,10 @@ impl HandlerInner {
             *crash_ctx = mem::MaybeUninit::zeroed();
             let cc = &mut *crash_ctx.as_mut_ptr();
 
-            ptr::copy_nonoverlapping(nix_info, &mut cc.siginfo, 1);
+            // The siginfo_t in libc is lowest common denominator, but this code is
+            // specifically targeting linux/android, which contains the si_pid field
+            // that we require
+            cc.siginfo = siginfo_to_signalfd(info);
 
             let uc_ptr = &*(uc as *const libc::c_void).cast::<crash_context::ucontext_t>();
             ptr::copy_nonoverlapping(uc_ptr, &mut cc.context, 1);
@@ -500,5 +538,110 @@ impl Drop for SetDumpable {
                 libc::syscall(libc::SYS_prctl, PR_SET_DUMPABLE, 0, 0, 0, 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libc::{c_int, c_void};
+
+    // `siginfo_t` exposes its union only through read-only accessors
+    // (si_addr()/si_pid()/...), so to *build* a test input we mirror libc's own
+    // internal `siginfo_f` layout. The union's pointer member reproduces the
+    // exact alignment the kernel uses (8 bytes on 64-bit, 4 on 32-bit), so
+    // `fault_addr` lands where `si_addr()` reads it and `kill` where
+    // si_pid()/si_uid() read theirs — no hand-computed offsets.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SifieldsKill {
+        si_pid: libc::pid_t,
+        si_uid: libc::uid_t,
+    }
+
+    #[repr(C)]
+    union Sifields {
+        _align: *mut c_void,
+        fault_addr: *mut c_void,
+        kill: SifieldsKill,
+    }
+
+    #[repr(C)]
+    struct RawSiginfo {
+        base: [c_int; 3], // si_signo, si_errno, si_code
+        fields: Sifields,
+    }
+
+    /// A hardware-fault `siginfo_t` (SEGV/BUS/ILL/FPE/TRAP): carries si_addr.
+    unsafe fn fault_siginfo(signo: c_int, code: c_int, addr: *mut c_void) -> libc::siginfo_t {
+        let mut info: libc::siginfo_t = mem::zeroed();
+        let raw = (&mut info as *mut libc::siginfo_t).cast::<RawSiginfo>();
+        (*raw).base = [signo, 0, code];
+        (*raw).fields.fault_addr = addr;
+        info
+    }
+
+    /// A process-sent `siginfo_t` (kill/sigqueue): carries sender pid/uid.
+    unsafe fn process_siginfo(
+        signo: c_int,
+        code: c_int,
+        pid: libc::pid_t,
+        uid: libc::uid_t,
+    ) -> libc::siginfo_t {
+        let mut info: libc::siginfo_t = mem::zeroed();
+        let raw = (&mut info as *mut libc::siginfo_t).cast::<RawSiginfo>();
+        (*raw).base = [signo, 0, code];
+        (*raw).fields.kill = SifieldsKill {
+            si_pid: pid,
+            si_uid: uid,
+        };
+        info
+    }
+
+    // A fixed, non-zero, deliberately misaligned sentinel that must survive the
+    // siginfo_t -> signalfd_siginfo translation which used to be erased
+    #[cfg(target_pointer_width = "64")]
+    const FAULT_ADDR: usize = 0x1_0000_0041;
+    #[cfg(target_pointer_width = "32")]
+    const FAULT_ADDR: usize = 0x1_0041;
+    // Not exposed by this libc version on linux; upstream kernel values.
+    const SEGV_MAPERR: c_int = 1;
+    const SI_KERNEL: c_int = 0x80;
+
+    #[test]
+    fn fault_signal_preserves_address() {
+        let info = unsafe { fault_siginfo(libc::SIGSEGV, SEGV_MAPERR, FAULT_ADDR as *mut c_void) };
+        let sfd = siginfo_to_signalfd(&info);
+
+        assert_eq!(sfd.ssi_signo, libc::SIGSEGV as u32);
+        assert_eq!(sfd.ssi_code, SEGV_MAPERR);
+        // Ensure the fault address is never lost/zeroed as in previous versions
+        assert_eq!(sfd.ssi_addr, FAULT_ADDR as u64);
+    }
+
+    #[test]
+    fn kernel_trap_preserves_signo_and_code() {
+        // SIGTRAP / SI_KERNEL / addr 0 — the int3-breakpoint signature that
+        // dominates real Linux reports; must round-trip faithfully.
+        // SAFETY: We only generate valud union combinations that mirror what Linux would provide.
+        let info = unsafe { fault_siginfo(libc::SIGTRAP, SI_KERNEL, ptr::null_mut()) };
+        let sfd = siginfo_to_signalfd(&info);
+
+        assert_eq!(sfd.ssi_signo, libc::SIGTRAP as u32);
+        assert_eq!(sfd.ssi_code, SI_KERNEL);
+        assert_eq!(sfd.ssi_addr, 0);
+    }
+
+    #[test]
+    fn process_sent_signal_preserves_pid_uid() {
+        // The abort()/kill() path (si_code <= 0): pid/uid are meaningful, not addr.
+        // SAFETY: We only generate valud union combinations that mirror what Linux would provide.
+        let info = unsafe { process_siginfo(libc::SIGABRT, SI_USER, 4242, 1000) };
+        let sfd = siginfo_to_signalfd(&info);
+
+        assert_eq!(sfd.ssi_signo, libc::SIGABRT as u32);
+        assert_eq!(sfd.ssi_code, SI_USER);
+        assert_eq!(sfd.ssi_pid, 4242);
+        assert_eq!(sfd.ssi_uid, 1000);
     }
 }
