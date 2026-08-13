@@ -342,7 +342,7 @@ impl Server {
                                         match Self::handle_crash_request(crash_ctx, handler.as_ref()) {
                                             Err(err) => {
                                                 log::error!("failed to capture minidump: {err}");
-                                                LoopAction::Continue
+                                                handler.on_minidump_created(Err(err))
                                             }
                                             Ok(action) => {
                                                 log::info!("captured minidump");
@@ -465,13 +465,14 @@ impl Server {
                     minidump_writer::minidump_writer::MinidumpWriter::new(crash_context.pid, crash_context.tid);
                 writer.set_crash_context(minidump_writer::crash_context::CrashContext { inner: crash_context });
             } else if #[cfg(target_os = "windows")] {
-                // SAFETY: Unfortunately this is a bit dangerous since we are relying on the crashing process
-                // to still be alive and still have the interior pointers in the crash context still at the
-                // same location in memory, unfortunately it's a bit hard to communicate this through so
-                // many layers, so really, we are falling back on Windows to actually correctly handle
-                // if the interior pointers have become invalid which it should? do ok with
+                // The exception_pointers field in DumpRequest is a pointer into the crashing
+                // process's memory. MiniDumpWriteDump reads it via ReadProcessMemory, so if the
+                // process has already exited or that memory has been freed the dump may be
+                // incomplete. Windows handles this gracefully rather than faulting.
+                let process_handle = handler.process_handle_for_pid(crash_context.process_id);
+                handler.pre_dump(process_handle.unwrap_or(0), crash_context.process_id);
                 let mut result =
-                    minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(crash_context, None, None);
+                    minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(crash_context, process_handle, None, None);
             } else if #[cfg(target_os = "macos")] {
                 let mut writer = minidump_writer::minidump_writer::MinidumpWriter::with_crash_context(crash_context);
             }

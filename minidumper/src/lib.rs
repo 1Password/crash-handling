@@ -59,4 +59,17 @@ pub trait ServerHandler: Send + Sync {
     fn on_client_disconnected(&self, _num_clients: usize) -> LoopAction {
         LoopAction::Continue
     }
+    /// Returns a pre-opened process handle for the given process ID, to be used
+    /// instead of calling `OpenProcess` internally.
+    ///
+    /// Return `None` to fall back to the default `OpenProcess` behaviour.
+    #[cfg(target_os = "windows")]
+    fn process_handle_for_pid(&self, _pid: u32) -> Option<isize> {
+        None
+    }
+    /// Called immediately before the minidump is written, with the pre-opened
+    /// process handle (if any) and the process ID. Use this to perform any
+    /// preparation needed before `MiniDumpWriteDump` is invoked.
+    #[cfg(target_os = "windows")]
+    fn pre_dump(&self, _process_handle: isize, _pid: u32) {}
 }
