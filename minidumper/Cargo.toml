@@ -24,7 +24,7 @@ libc.workspace = true
 # Basic log emitting
 log = "0.4"
 # Minidump writing
-minidump-writer = { git = "https://github.com/1Password/minidump-writer.git", branch = "windows_minidump_to_memory" }
+minidump-writer = { git = "https://github.com/1Password/minidump-writer.git", branch = "windows-out-of-process-crash-handler" }
 # Event loop
 polling = "3.2"
 # Nicer locking primitives

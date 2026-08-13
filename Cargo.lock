@@ -468,7 +468,7 @@ dependencies = [
 [[package]]
 name = "minidump-writer"
 version = "0.8.2"
-source = "git+https://github.com/1Password/minidump-writer.git?branch=windows_minidump_to_memory#2142b916f9b961df38d4d623c2ad9c5c86eadc32"
+source = "git+https://github.com/1Password/minidump-writer.git?branch=windows-out-of-process-crash-handler#5fef81712046a4148fa7cc6cce863757f57c7694"
 dependencies = [
  "bitflags",
  "byteorder",
