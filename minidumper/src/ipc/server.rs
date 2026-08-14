@@ -1,7 +1,7 @@
 use super::{Connection, Header, Listener, SocketName};
 use crate::{Error, LoopAction};
 use polling::{Event, Poller};
-use std::io::ErrorKind;
+use std::io::{Cursor, ErrorKind, Write};
 use std::time::{Duration, Instant};
 
 /// Server side of the connection, which runs in the monitor process that is
@@ -17,6 +17,10 @@ pub struct Server {
     /// may need to harden this code if people experience issues with socket
     /// paths not being cleaned up reliably
     socket_path: Option<std::path::PathBuf>,
+    /// When set, dump requests must carry this token to be honored. See
+    /// [`Server::set_auth_token`].
+    #[cfg(target_os = "windows")]
+    auth_token: Option<[u8; super::AUTH_TOKEN_LEN]>,
 }
 
 struct ClientConn {
@@ -113,14 +117,18 @@ impl Server {
                 listener.set_nonblocking(true)?;
             } else if #[cfg(target_os = "macos")] {
                 let SocketName::Path(path) = sn;
-                let listener = Listener::bind(path)?;
-                listener.set_nonblocking(true)?;
 
                 // Note that sun_path is limited to 108 characters including null,
                 // while a mach port name is limited to 128 including null, so
                 // the length is already effectively checked here
+
+                // We setup the mach port first so no one can race to creating the
+                // port.
                 let port_name = std::ffi::CString::new(path.to_str().ok_or(Error::InvalidPortName)?).map_err(|_err| Error::InvalidPortName)?;
                 let port = crash_context::ipc::Server::create(&port_name)?;
+
+                let listener = Listener::bind(path)?;
+                listener.set_nonblocking(true)?;
             } else {
                 compile_error!("unimplemented target platform");
             }
@@ -131,7 +139,21 @@ impl Server {
             #[cfg(target_os = "macos")]
             port,
             socket_path,
+            #[cfg(target_os = "windows")]
+            auth_token: None,
         })
+    }
+
+    /// Requires every dump request to carry the given authentication token.
+    ///
+    /// On Windows the IPC socket exposes no peer credentials so any same-user
+    /// process could otherwise connect to the socket and trigger a dump of the
+    /// monitored process. Sharing a secret token with the [`crate::Client`] over
+    /// a trusted side channel and applying it lets the server reject requests
+    /// that don't originate from the monitored process.
+    #[cfg(target_os = "windows")]
+    pub fn set_auth_token(&mut self, token: [u8; super::AUTH_TOKEN_LEN]) {
+        self.auth_token = Some(token);
     }
 
     /// Runs the server loop, accepting client connections and receiving IPC
@@ -161,6 +183,9 @@ impl Server {
     ) -> Result<(), Error> {
         let mut events = polling::Events::new();
         let listener = self.listener.take().unwrap();
+
+        #[cfg(target_os = "windows")]
+        let expected_auth_token = self.auth_token;
 
         struct Poll {
             listener: Listener,
@@ -218,7 +243,7 @@ impl Server {
             }
 
             events.clear();
-            let timeout = Duration::from_millis(10);
+            let timeout = Duration::from_millis(200);
             let deadline = Instant::now() + timeout;
             let mut remaining = Some(timeout);
             while let Some(timeout) = remaining {
@@ -295,13 +320,14 @@ impl Server {
                                 } else {
                                     let cc = polling.clients.swap_remove(pos);
 
+                                    let crash_ctx: Option<crash_context::CrashContext>;
                                     cfg_if::cfg_if! {
                                         if #[cfg(any(target_os = "linux", target_os = "android"))] {
                                             let peer_creds = cc.socket.0.initial_peer_credentials()?;
 
                                             let pid = peer_creds.pid().ok_or(Error::UnknownClientPid)?;
 
-                                            let crash_ctx = crash_context::CrashContext::from_bytes(&buffer).ok_or_else(|| {
+                                            let parsed = crash_context::CrashContext::from_bytes(&buffer).ok_or_else(|| {
                                                 Error::from(std::io::Error::new(
                                                     std::io::ErrorKind::InvalidData,
                                                     "client sent an incorrectly sized buffer",
@@ -309,55 +335,72 @@ impl Server {
                                             })?;
 
                                             // Validate that the crash info and the socket agree on the pid
-                                            if pid.get() != crash_ctx.pid as u32 {
+                                            if pid.get() != parsed.pid as u32 {
                                                 return Err(Error::UnknownClientPid);
                                             }
+
+                                            crash_ctx = Some(parsed);
                                         } else if #[cfg(target_os = "windows")] {
                                             use scroll::Pread;
-                                            let dump_request: super::DumpRequest = buffer.pread(0)?;
+                                            let mut offset = 0;
+                                            let dump_request: super::DumpRequest = buffer.gread(&mut offset)?;
 
-                                            // MiniDumpWriteDump primarily uses `EXCEPTION_POINTERS` for its crash
-                                            // context information, but inside that is an `EXCEPTION_RECORD`, which
-                                            // is an internally linked list, so rather than recurse and allocate until
-                                            // the end of that linked list, we just retrieve the actual pointer from
-                                            // the client process, and inform the dump writer that they are pointers
-                                            // to a different process, as MiniDumpWriteDump will internally read
-                                            // the processes memory as needed
-                                            let exception_pointers = dump_request.exception_pointers as *const crash_context::EXCEPTION_POINTERS;
-
-                                            let crash_ctx = crash_context::CrashContext {
-                                                exception_pointers,
-                                                process_id: dump_request.process_id,
-                                                thread_id: dump_request.thread_id,
-                                                exception_code: dump_request.exception_code,
+                                            let authenticated = match expected_auth_token.as_ref() {
+                                                Some(expected) => buffer
+                                                    .get(offset..offset + super::AUTH_TOKEN_LEN)
+                                                    .is_some_and(|token| constant_time_eq(token, expected)),
+                                                None => true,
                                             };
+
+                                            if authenticated {
+                                                // MiniDumpWriteDump primarily uses `EXCEPTION_POINTERS` for its crash
+                                                // context information, but inside that is an `EXCEPTION_RECORD`, which
+                                                // is an internally linked list, so rather than recurse and allocate until
+                                                // the end of that linked list, we just retrieve the actual pointer from
+                                                // the client process, and inform the dump writer that they are pointers
+                                                // to a different process, as MiniDumpWriteDump will internally read
+                                                // the processes memory as needed
+                                                let exception_pointers = dump_request.exception_pointers as *const crash_context::EXCEPTION_POINTERS;
+
+                                                crash_ctx = Some(crash_context::CrashContext {
+                                                    exception_pointers,
+                                                    process_id: dump_request.process_id,
+                                                    thread_id: dump_request.thread_id,
+                                                    exception_code: dump_request.exception_code,
+                                                });
+                                            } else {
+                                                log::warn!("rejecting crash dump request with missing or invalid authentication token");
+                                                crash_ctx = None;
+                                            }
                                         }
                                     }
 
-                                    let action =
-                                        match Self::handle_crash_request(crash_ctx, handler.as_ref()) {
-                                            Err(err) => {
-                                                log::error!("failed to capture minidump: {err}");
-                                                LoopAction::Continue
-                                            }
-                                            Ok(action) => {
-                                                log::info!("captured minidump");
-                                                action
-                                            }
+                                    if let Some(crash_ctx) = crash_ctx {
+                                        let action =
+                                            match Self::handle_crash_request(crash_ctx, handler.as_ref()) {
+                                                Err(err) => {
+                                                    log::error!("failed to capture minidump: {err}");
+                                                    handler.on_minidump_created(Err(err))
+                                                }
+                                                Ok(action) => {
+                                                    log::info!("captured minidump");
+                                                    action
+                                                }
+                                            };
+
+                                        let ack = Header {
+                                            kind: super::CRASH_ACK,
+                                            size: 0,
                                         };
 
-                                    let ack = Header {
-                                        kind: super::CRASH_ACK,
-                                        size: 0,
-                                    };
+                                        if let Err(err) = cc.socket.send(ack.as_bytes()) {
+                                            log::error!("failed to send ack: {err}");
+                                        }
 
-                                    if let Err(err) = cc.socket.send(ack.as_bytes()) {
-                                        log::error!("failed to send ack: {err}");
-                                    }
-
-                                    if action == LoopAction::Exit {
-                                        log::debug!("user handler requested exit after minidump creation");
-                                        return Ok(());
+                                        if action == LoopAction::Exit {
+                                            log::debug!("user handler requested exit after minidump creation");
+                                            return Ok(());
+                                        }
                                     }
 
                                     Some(cc.socket)
@@ -451,7 +494,9 @@ impl Server {
         crash_context: crash_context::CrashContext,
         handler: &dyn crate::ServerHandler,
     ) -> Result<LoopAction, Error> {
-        let (mut minidump_file, minidump_path) = handler.create_minidump_file()?;
+        let (mut minidump_hard_file, minidump_path) = handler.create_minidump_file()?.unzip();
+        #[cfg(not(target_os = "windows"))]
+        let mut minidump_file: Cursor<Vec<u8>> = Cursor::new(Vec::new());
 
         cfg_if::cfg_if! {
             if #[cfg(any(target_os = "linux", target_os = "android"))] {
@@ -459,31 +504,44 @@ impl Server {
                     minidump_writer::minidump_writer::MinidumpWriter::new(crash_context.pid, crash_context.tid);
                 writer.set_crash_context(minidump_writer::crash_context::CrashContext { inner: crash_context });
             } else if #[cfg(target_os = "windows")] {
-                // SAFETY: Unfortunately this is a bit dangerous since we are relying on the crashing process
-                // to still be alive and still have the interior pointers in the crash context still at the
-                // same location in memory, unfortunately it's a bit hard to communicate this through so
-                // many layers, so really, we are falling back on Windows to actually correctly handle
-                // if the interior pointers have become invalid which it should? do ok with
-                let result =
-                    minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(crash_context, None, &mut minidump_file);
+                // The exception_pointers field in DumpRequest is a pointer into the crashing
+                // process's memory. MiniDumpWriteDump reads it via ReadProcessMemory, so if the
+                // process has already exited or that memory has been freed the dump may be
+                // incomplete. Windows handles this gracefully rather than faulting.
+                let process_handle = handler.process_handle_for_pid(crash_context.process_id);
+                handler.pre_dump(process_handle.unwrap_or(0), crash_context.process_id);
+                let mut result =
+                    minidump_writer::minidump_writer::MinidumpWriter::dump_crash_context(crash_context, process_handle, None, None);
             } else if #[cfg(target_os = "macos")] {
                 let mut writer = minidump_writer::minidump_writer::MinidumpWriter::with_crash_context(crash_context);
             }
         }
-
         #[cfg(not(target_os = "windows"))]
         let result = writer.dump(&mut minidump_file);
-
+        if let Some(minidump_hard_file) = minidump_hard_file.as_mut() {
+            #[cfg(not(target_os = "windows"))]
+            {
+                let buffer = &minidump_file.clone().into_inner();
+                minidump_hard_file.write_all(buffer).unwrap();
+                minidump_hard_file.flush().unwrap();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                result = result.and_then(
+                    |buffer| -> Result<Vec<u8>, minidump_writer::errors::Error> {
+                        minidump_hard_file.write_all(&buffer)?;
+                        Ok(buffer)
+                    },
+                );
+            }
+        }
         // Notify the user handler about the minidump, even if we failed to write it
         Ok(handler.on_minidump_created(
             result
-                .map(|_contents| crate::MinidumpBinary {
-                    file: minidump_file,
+                .map(|contents| crate::MinidumpBinary {
+                    file: minidump_hard_file,
                     path: minidump_path,
-                    #[cfg(target_os = "windows")]
-                    contents: None,
-                    #[cfg(not(target_os = "windows"))]
-                    contents: Some(_contents),
+                    contents: contents,
                 })
                 .map_err(crate::Error::from),
         ))
@@ -533,6 +591,21 @@ impl Server {
             Ok(LoopAction::Continue)
         }
     }
+}
+
+/// Compares two byte slices in constant time to avoid leaking the auth token
+/// through comparison timing.
+#[cfg(target_os = "windows")]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl Drop for Server {
