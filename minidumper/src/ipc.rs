@@ -144,6 +144,12 @@ const PING: u32 = 2;
 const PONG: u32 = 3;
 const USER: u32 = 4;
 
+/// Length in bytes of the authentication token used on Windows to verify that a
+/// crash dump request originates from the monitored process. See
+/// [`crate::Server::set_auth_token`].
+#[cfg(target_os = "windows")]
+pub const AUTH_TOKEN_LEN: usize = 32;
+
 /// A socket name.
 ///
 /// Linux, Windows, and Macos can all use a file path as the name for the socket.
