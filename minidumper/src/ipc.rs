@@ -74,10 +74,8 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "windows")] {
         mod windows;
 
-        type Stream = windows::UnixStream;
-
-        type Listener = windows::UnixListener;
-        type Connection = windows::UnixStream;
+        type Stream = windows::PipeStream;
+        type Listener = windows::PipeListener;
 
         // This will of course break if the client and server are built for different
         // arches, but that is the fault of the user in that case

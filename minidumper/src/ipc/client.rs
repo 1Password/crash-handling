@@ -103,18 +103,20 @@ impl Client {
                 let crash_ctx_buffer = crash_context.as_bytes();
             } else if #[cfg(target_os = "windows")] {
                 use scroll::Pwrite;
+                // Fixed-size stack buffer: the crash path must not allocate.
                 let mut buf = [0u8; 24];
-                let written = buf.pwrite(
+                let mut offset = 0;
+                buf.gwrite(
                     super::DumpRequest {
                         exception_pointers: crash_context.exception_pointers as _,
                         process_id: crash_context.process_id,
                         thread_id: crash_context.thread_id,
                         exception_code: crash_context.exception_code,
                     },
-                    0,
+                    &mut offset,
                 )?;
 
-                let crash_ctx_buffer = &buf[..written];
+                let crash_ctx_buffer = &buf[..offset];
             } else if #[cfg(target_os = "macos")] {
                 self.port.send_crash_context(
                     crash_context,

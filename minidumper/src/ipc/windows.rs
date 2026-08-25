@@ -1,518 +1,729 @@
-//! Implements support for Unix domain sockets for Windows. This should probably
-//! be a part of an external crate such as `uds`, but currently no Rust crates
-//! support them, or if they do, use outdated dependencies such as winapi
+//! Named pipe IPC transport for Windows.
 
-#![allow(clippy::mem_forget, unsafe_code)]
+#![allow(
+    unsafe_code,
+    non_camel_case_types,
+    non_snake_case,
+    clippy::upper_case_acronyms
+)]
 
-use std::{
-    io,
-    os::windows::{
-        io::{AsRawSocket, AsSocket, FromRawSocket, IntoRawSocket, RawSocket},
-        prelude::BorrowedSocket,
-    },
-};
+use std::io;
 
-#[allow(non_camel_case_types, non_snake_case, clippy::upper_case_acronyms)]
-mod bindings {
-    pub const PF_UNIX: i32 = 1;
-    pub const SOCK_STREAM: i32 = 1;
-    pub const FIONBIO: i32 = -2147195266;
-    pub const INVALID_SOCKET: usize = !0;
-    pub const SD_SEND: u32 = 1;
-    pub const SOCKET_ERROR: i32 = -1;
+type HANDLE = isize;
+type BOOL = i32;
+type DWORD = u32;
+type ULONG_PTR = usize;
+type LPVOID = *mut core::ffi::c_void;
+type LPCWSTR = *const u16;
+type LPDWORD = *mut DWORD;
+type PSID = *mut core::ffi::c_void;
 
-    #[repr(C)]
-    pub struct WSABUF {
-        pub len: u32,
-        pub buf: *const u8,
-    }
+const INVALID_HANDLE_VALUE: HANDLE = -1_isize;
+const INFINITE: DWORD = 0xFFFF_FFFF;
+const WAIT_OBJECT_0: DWORD = 0;
+const WAIT_TIMEOUT: DWORD = 258;
 
-    pub type ADDRESS_FAMILY = u16;
+const ERROR_IO_PENDING: DWORD = 997;
+const ERROR_PIPE_CONNECTED: DWORD = 535;
+const ERROR_BROKEN_PIPE: DWORD = 109;
+const ERROR_OPERATION_ABORTED: DWORD = 995;
+const ERROR_FILE_NOT_FOUND: DWORD = 2;
 
-    #[repr(C)]
-    pub struct SOCKADDR {
-        pub sa_family: ADDRESS_FAMILY,
-        pub sa_data: [u8; 14],
-    }
+const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
+const FILE_FLAG_FIRST_PIPE_INSTANCE: DWORD = 0x0008_0000;
+const PIPE_ACCESS_DUPLEX: DWORD = 0x0000_0003;
+const PIPE_TYPE_BYTE: DWORD = 0x0000_0000;
+const PIPE_READMODE_BYTE: DWORD = 0x0000_0000;
+const PIPE_WAIT: DWORD = 0x0000_0000;
+const PIPE_UNLIMITED_INSTANCES: DWORD = 255;
+const PIPE_BUFFER_SIZE: DWORD = 65536;
+const GENERIC_READ: DWORD = 0x8000_0000;
+const GENERIC_WRITE: DWORD = 0x4000_0000;
+const OPEN_EXISTING: DWORD = 3;
+const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
+const TOKEN_QUERY: DWORD = 0x0000_0008;
+const TOKEN_USER: u32 = 1;
 
-    pub type BOOL = i32;
-    pub type HANDLE = isize;
-    pub type HANDLE_FLAGS = u32;
-    pub const HANDLE_FLAG_INHERIT: HANDLE_FLAGS = 1;
-
-    pub type SOCKET = usize;
-
-    pub type SEND_RECV_FLAGS = i32;
-    pub const MSG_PEEK: SEND_RECV_FLAGS = 2;
-
-    #[repr(C)]
-    pub struct OVERLAPPED_0_0 {
-        pub Offset: u32,
-        pub OffsetHigh: u32,
-    }
-
-    #[repr(C)]
-    pub union OVERLAPPED_0 {
-        pub Anonymous: std::mem::ManuallyDrop<OVERLAPPED_0_0>,
-        pub Pointer: *mut std::ffi::c_void,
-    }
-
-    #[repr(C)]
-    pub struct OVERLAPPED {
-        pub Internal: usize,
-        pub InternalHigh: usize,
-        pub Anonymous: OVERLAPPED_0,
-        pub hEvent: HANDLE,
-    }
-
-    pub type LPWSAOVERLAPPED_COMPLETION_ROUTINE = Option<
-        unsafe extern "system" fn(
-            dwError: u32,
-            cbTransferred: u32,
-            lpOverlapped: *mut OVERLAPPED,
-            dwFlags: u32,
-        ),
-    >;
-
-    pub type WSA_ERROR = i32;
-    pub const WSAESHUTDOWN: WSA_ERROR = 10058;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn SetHandleInformation(hObject: HANDLE, dwMask: u32, dwFlags: HANDLE_FLAGS) -> BOOL;
-    }
-
-    #[link(name = "ws2_32")]
-    extern "system" {
-        pub fn socket(af: i32, type_: i32, protocol: i32) -> SOCKET;
-        pub fn closesocket(s: SOCKET) -> i32;
-        pub fn accept(s: SOCKET, addr: *mut SOCKADDR, addrlen: *mut i32) -> SOCKET;
-        pub fn recv(s: SOCKET, buf: *const u8, len: i32, flags: SEND_RECV_FLAGS) -> i32;
-        pub fn WSARecv(
-            s: SOCKET,
-            lpBuffers: *const WSABUF,
-            dwBufferCount: u32,
-            lpNumberOfBytesRecvd: *mut u32,
-            lpFlags: *mut u32,
-            lpOverlapped: *mut OVERLAPPED,
-            lpCompletionRoutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
-        ) -> i32;
-        pub fn WSASend(
-            s: SOCKET,
-            lpBuffers: *const WSABUF,
-            dwBufferCount: u32,
-            lpNumberOfBytesSent: *mut u32,
-            dwFlags: u32,
-            lpOverlapped: *mut OVERLAPPED,
-            lpCompletionRoutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
-        ) -> i32;
-        pub fn ioctlsocket(s: SOCKET, cmd: i32, argp: *mut u32) -> i32;
-        pub fn WSAGetLastError() -> WSA_ERROR;
-        pub fn shutdown(s: SOCKET, how: i32) -> i32;
-        pub fn bind(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
-        pub fn listen(s: SOCKET, backlog: i32) -> i32;
-        pub fn connect(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32;
-    }
-}
-
-#[derive(Copy, Clone)]
 #[repr(C)]
-pub struct sockaddr_un {
-    pub sun_family: u16,
-    pub sun_path: [u8; 108],
+struct OVERLAPPED {
+    Internal: ULONG_PTR,
+    InternalHigh: ULONG_PTR,
+    Offset: DWORD,
+    OffsetHigh: DWORD,
+    hEvent: HANDLE,
 }
 
-pub(crate) fn init() {
-    static INIT: parking_lot::Once = parking_lot::Once::new();
-    INIT.call_once(|| {
-        // Let standard library call `WSAStartup` for us, we can't do it
-        // ourselves because otherwise using any type in `std::net` would panic
-        // when it tries to call `WSAStartup` a second time.
-        drop(std::net::UdpSocket::bind("127.0.0.1:0"));
-    });
+#[repr(C)]
+struct SECURITY_ATTRIBUTES {
+    nLength: DWORD,
+    lpSecurityDescriptor: LPVOID,
+    bInheritHandle: BOOL,
+}
+
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateNamedPipeW(
+        lpName: LPCWSTR,
+        dwOpenMode: DWORD,
+        dwPipeMode: DWORD,
+        nMaxInstances: DWORD,
+        nOutBufferSize: DWORD,
+        nInBufferSize: DWORD,
+        nDefaultTimeOut: DWORD,
+        lpSecurityAttributes: *mut SECURITY_ATTRIBUTES,
+    ) -> HANDLE;
+    fn ConnectNamedPipe(hNamedPipe: HANDLE, lpOverlapped: *mut OVERLAPPED) -> BOOL;
+    fn DisconnectNamedPipe(hNamedPipe: HANDLE) -> BOOL;
+    fn CreateFileW(
+        lpFileName: LPCWSTR,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        lpSecurityAttributes: *mut SECURITY_ATTRIBUTES,
+        dwCreationDisposition: DWORD,
+        dwFlagsAndAttributes: DWORD,
+        hTemplateFile: HANDLE,
+    ) -> HANDLE;
+    fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: *mut u8,
+        nNumberOfBytesToRead: DWORD,
+        lpNumberOfBytesRead: LPDWORD,
+        lpOverlapped: *mut OVERLAPPED,
+    ) -> BOOL;
+    fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: *const u8,
+        nNumberOfBytesToWrite: DWORD,
+        lpNumberOfBytesWritten: LPDWORD,
+        lpOverlapped: *mut OVERLAPPED,
+    ) -> BOOL;
+    fn PeekNamedPipe(
+        hNamedPipe: HANDLE,
+        lpBuffer: *mut u8,
+        nBufferSize: DWORD,
+        lpBytesRead: LPDWORD,
+        lpTotalBytesAvail: LPDWORD,
+        lpBytesLeftThisMessage: LPDWORD,
+    ) -> BOOL;
+    fn GetNamedPipeClientProcessId(Pipe: HANDLE, ClientProcessId: *mut DWORD) -> BOOL;
+    fn CreateEventW(
+        lpEventAttributes: *mut SECURITY_ATTRIBUTES,
+        bManualReset: BOOL,
+        bInitialState: BOOL,
+        lpName: LPCWSTR,
+    ) -> HANDLE;
+    fn SetEvent(hEvent: HANDLE) -> BOOL;
+    fn ResetEvent(hEvent: HANDLE) -> BOOL;
+    fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
+    fn GetOverlappedResult(
+        hFile: HANDLE,
+        lpOverlapped: *mut OVERLAPPED,
+        lpNumberOfBytesTransferred: LPDWORD,
+        bWait: BOOL,
+    ) -> BOOL;
+    fn CancelIoEx(hFile: HANDLE, lpOverlapped: *const OVERLAPPED) -> BOOL;
+    fn WaitNamedPipeW(lpNamedPipeName: LPCWSTR, nTimeOut: DWORD) -> BOOL;
+    fn Sleep(dwMilliseconds: DWORD);
+    fn GetTickCount64() -> u64;
+    fn GetCurrentProcess() -> HANDLE;
+    fn GetLastError() -> DWORD;
+    fn CloseHandle(hObject: HANDLE) -> BOOL;
+    fn LocalFree(hMem: LPVOID) -> LPVOID;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(
+        ProcessHandle: HANDLE,
+        DesiredAccess: DWORD,
+        TokenHandle: *mut HANDLE,
+    ) -> BOOL;
+    fn GetTokenInformation(
+        TokenHandle: HANDLE,
+        TokenInformationClass: u32,
+        TokenInformation: *mut u8,
+        TokenInformationLength: DWORD,
+        ReturnLength: *mut DWORD,
+    ) -> BOOL;
+    fn ConvertSidToStringSidW(Sid: PSID, StringSid: *mut *mut u16) -> BOOL;
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        StringSecurityDescriptor: LPCWSTR,
+        StringSDRevision: DWORD,
+        SecurityDescriptor: *mut LPVOID,
+        SecurityDescriptorSize: *mut DWORD,
+    ) -> BOOL;
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(core::iter::once(0)).collect()
+}
+
+fn last_error() -> io::Error {
+    io::Error::last_os_error()
+}
+
+/// Derives a `\\.\pipe\<stem>` wide path. Only the final path component is
+/// used so callers can pass either a full temp path or a bare name.
+pub(crate) fn pipe_path_from(path: &std::path::Path) -> io::Result<Vec<u16>> {
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pipe name"))?;
+    Ok(to_wide(&format!(r"\\.\pipe\{stem}")))
 }
 
 #[inline]
-fn last_socket_error() -> io::Error {
-    // SAFETY: syscall
-    io::Error::from_raw_os_error(unsafe { bindings::WSAGetLastError() })
+fn win32_ok(result: BOOL) -> io::Result<()> {
+    if result == 0 {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
 }
 
-pub(crate) struct UnixSocketAddr {
-    addr: sockaddr_un,
-    len: i32,
-}
-
-impl UnixSocketAddr {
-    pub(crate) fn from_path(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
-        let path = path.as_ref();
-        let path_bytes = path
-            .to_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path is not utf-8"))?
-            .as_bytes();
-
-        let mut sock_addr = sockaddr_un {
-            sun_family: bindings::PF_UNIX as _,
-            sun_path: [0u8; 108],
-        };
-
-        if path_bytes.len() >= sock_addr.sun_path.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "specified path is too long",
-            ));
+// RAII guard for an OS HANDLE.
+struct HandleGuard(HANDLE);
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        if self.0 != 0 && self.0 != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(self.0) };
         }
+    }
+}
 
-        sock_addr.sun_path[..path_bytes.len()].copy_from_slice(path_bytes);
+// RAII guard for a `LocalAlloc` allocation.
+struct LocalGuard(LPVOID);
+impl Drop for LocalGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
 
-        Self::from_parts(
-            sock_addr,
-            // Found some example Windows code that seemed to give no shits
-            // about the "actual" size of the address, so if Microsoft doesn't
-            // care why should we? https://devblogs.microsoft.com/commandline/windowswsl-interop-with-af_unix/
-            std::mem::size_of_val(&sock_addr) as i32,
+/// Returns a `SECURITY_ATTRIBUTES` whose DACL grants `GENERIC_ALL` only to
+/// the current user. The two `LocalGuard` values must remain alive as long as
+/// the `SECURITY_ATTRIBUTES` is in use.
+fn owner_only_security_attributes() -> io::Result<(SECURITY_ATTRIBUTES, LocalGuard)> {
+    // 1. Get the current user's SID via the process token.
+    let mut token: HANDLE = 0;
+    win32_ok(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) })?;
+    let _token_guard = HandleGuard(token);
+
+    let mut length: DWORD = 0;
+    unsafe { GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut length) };
+    let mut user_buf = vec![0u8; length as usize];
+    win32_ok(unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_USER,
+            user_buf.as_mut_ptr(),
+            length,
+            &mut length,
         )
-    }
+    })?;
 
-    #[inline]
-    fn from_parts(addr: sockaddr_un, len: i32) -> io::Result<Self> {
-        if addr.sun_family != bindings::PF_UNIX as _ {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "socket address is not a unix domain socket",
-            ))
-        } else {
-            Ok(Self { addr, len })
-        }
-    }
+    // TOKEN_USER.User.Sid is the first pointer-sized field in the buffer.
+    let sid: PSID = unsafe { *(user_buf.as_ptr() as *const PSID) };
+
+    // 2. Convert SID → string for use in the SDDL string.
+    let mut sid_str_ptr: *mut u16 = std::ptr::null_mut();
+    win32_ok(unsafe { ConvertSidToStringSidW(sid, &mut sid_str_ptr) })?;
+    let _sid_str_guard = LocalGuard(sid_str_ptr as LPVOID);
+
+    let sid_wcs_len = unsafe { (0_usize..).find(|&i| *sid_str_ptr.add(i) == 0).unwrap_or(0) };
+    let sid_string =
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_str_ptr, sid_wcs_len) });
+
+    // "D:P" = Protected DACL (no inheritance). "(A;;GA;;;SID)" = Allow Generic-All.
+    let sddl = to_wide(&format!("D:P(A;;GA;;;{sid_string})"));
+
+    // 3. Convert SDDL > a self-relative security descriptor (LocalAlloc'd by the OS).
+    // This descriptor already contains the DACL so no further modification is needed.
+    let mut descriptor: LPVOID = std::ptr::null_mut();
+    let mut descriptor_size: DWORD = 0;
+    win32_ok(unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1, // SDDL_REVISION_1
+            &mut descriptor,
+            &mut descriptor_size,
+        )
+    })?;
+    let sd_guard = LocalGuard(descriptor);
+
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as DWORD,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+
+    Ok((security_attributes, sd_guard))
 }
 
-struct Socket(bindings::SOCKET);
+/// Server-side named pipe listener.
+pub(crate) struct PipeListener {
+    /// Full `\\.\pipe\<name>` path as a wide string.
+    pipe_path: Vec<u16>,
+    /// Current pipe instance waiting for a connection.
+    handle: HANDLE,
+    /// Manual-reset event signaled when `ConnectNamedPipe` completes.
+    event: HANDLE,
+    /// Heap-allocated overlapped keeps the I/O state alive across method calls.
+    overlapped: Box<OVERLAPPED>,
+    /// True when a client connected before `ConnectNamedPipe` was called, so we
+    /// manually signaled the event.
+    connected: bool,
+}
 
-impl Socket {
-    pub fn new() -> io::Result<Socket> {
-        // SAFETY: syscall
-        let socket = unsafe { bindings::socket(bindings::PF_UNIX, bindings::SOCK_STREAM, 0) };
+impl PipeListener {
+    pub(crate) fn bind(path: &std::path::Path) -> io::Result<Self> {
+        let pipe_path = pipe_path_from(path)?;
 
-        if socket == bindings::INVALID_SOCKET {
-            Err(last_socket_error())
-        } else {
-            let socket = Self(socket);
-            socket.set_no_inherit()?;
-            Ok(socket)
+        let event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if event == 0 {
+            return Err(last_error());
         }
+
+        let mut overlapped = Box::new(OVERLAPPED {
+            Internal: 0,
+            InternalHigh: 0,
+            Offset: 0,
+            OffsetHigh: 0,
+            hEvent: event,
+        });
+
+        let handle = create_pipe_instance(&pipe_path, true)?;
+        let mut connected = false;
+        if let Err(e) = start_connect(handle, &mut overlapped, event, &mut connected) {
+            unsafe {
+                CloseHandle(handle);
+                CloseHandle(event);
+            }
+            return Err(e);
+        }
+
+        Ok(Self {
+            pipe_path,
+            handle,
+            event,
+            overlapped,
+            connected,
+        })
     }
 
-    fn accept(&self, storage: *mut bindings::SOCKADDR, len: &mut i32) -> io::Result<Self> {
-        // SAFETY: syscall
-        let socket = unsafe { bindings::accept(self.0, storage, len) };
-
-        if socket == bindings::INVALID_SOCKET {
-            Err(last_socket_error())
-        } else {
-            let socket = Self(socket);
-            socket.set_no_inherit()?;
-            Ok(socket)
-        }
-    }
-
-    #[inline]
-    fn set_no_inherit(&self) -> io::Result<()> {
-        // SAFETY: syscall
-        if unsafe { bindings::SetHandleInformation(self.0 as _, bindings::HANDLE_FLAG_INHERIT, 0) }
-            == 0
-        {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        let mut nonblocking = nonblocking as u32;
-        // SAFETY: syscall
-        let r = unsafe { bindings::ioctlsocket(self.0, bindings::FIONBIO, &mut nonblocking) };
-        if r == 0 {
-            Ok(())
-        } else {
-            Err(last_socket_error())
-        }
-    }
-
-    fn recv_with_flags(&self, buf: &mut [u8], flags: i32) -> io::Result<usize> {
-        // On unix when a socket is shut down all further reads return 0, so we
-        // do the same on windows to map a shut down socket to returning EOF.
-        let length = std::cmp::min(buf.len(), i32::MAX as usize) as i32;
-        // SAFETY: syscall
-        let result = unsafe {
-            bindings::recv(
-                self.as_raw_socket() as _,
-                buf.as_mut_ptr().cast(),
-                length,
-                flags,
-            )
-        };
-
+    /// Waits up to `timeout_ms` for a client connection.
+    /// Returns `None` on timeout, `Some(stream)` on success.
+    pub(crate) fn accept_timeout_ms(&mut self, timeout_ms: u32) -> io::Result<Option<PipeStream>> {
+        let result = unsafe { WaitForSingleObject(self.event, timeout_ms) };
         match result {
-            bindings::SOCKET_ERROR => {
-                let error = unsafe { bindings::WSAGetLastError() };
+            WAIT_TIMEOUT => return Ok(None),
+            WAIT_OBJECT_0 => {}
+            _ => return Err(last_error()),
+        }
 
-                if error == bindings::WSAESHUTDOWN {
-                    Ok(0)
-                } else {
-                    Err(io::Error::from_raw_os_error(error))
+        // Confirm the overlapped result (skip when we signaled manually).
+        if !self.connected {
+            let mut bytes: DWORD = 0;
+            let ok =
+                unsafe { GetOverlappedResult(self.handle, &mut *self.overlapped, &mut bytes, 0) };
+            if ok == 0 {
+                let err = unsafe { GetLastError() };
+                if err != ERROR_PIPE_CONNECTED {
+                    return Err(io::Error::from_raw_os_error(err as i32));
                 }
             }
-            _ => Ok(result as usize),
         }
+
+        let connected_handle = core::mem::replace(&mut self.handle, INVALID_HANDLE_VALUE);
+
+        // Ready the listener for the next connection.
+        match create_pipe_instance(&self.pipe_path, false) {
+            Ok(next) => {
+                self.handle = next;
+                unsafe { ResetEvent(self.event) };
+                self.overlapped.hEvent = self.event;
+                self.connected = false;
+                if let Err(e) = start_connect(
+                    self.handle,
+                    &mut self.overlapped,
+                    self.event,
+                    &mut self.connected,
+                ) {
+                    log::warn!("failed to start next ConnectNamedPipe: {e}");
+                }
+            }
+            Err(e) => log::warn!("failed to create next pipe instance: {e}"),
+        }
+
+        Ok(Some(PipeStream {
+            handle: connected_handle,
+        }))
     }
+}
 
-    fn recv_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
-        // On unix when a socket is shut down all further reads return 0, so we
-        // do the same on windows to map a shut down socket to returning EOF.
-        let length = std::cmp::min(bufs.len(), u32::MAX as usize) as u32;
-        let mut nread = 0;
-        let mut flags = 0;
-        // SAFETY: syscall
-        let result = unsafe {
-            bindings::WSARecv(
-                self.as_raw_socket() as _,
-                bufs.as_mut_ptr().cast(),
-                length,
-                &mut nread,
-                &mut flags,
-                std::ptr::null_mut(),
-                None,
-            )
-        };
-
-        if result == 0 {
-            Ok(nread as usize)
-        } else {
-            // SAFETY: syscall
-            let error = unsafe { bindings::WSAGetLastError() };
-
-            if error == bindings::WSAESHUTDOWN {
-                Ok(0)
-            } else {
-                Err(io::Error::from_raw_os_error(error))
+impl Drop for PipeListener {
+    fn drop(&mut self) {
+        if self.handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                DisconnectNamedPipe(self.handle);
+                CloseHandle(self.handle);
             }
         }
+        if self.event != 0 {
+            unsafe { CloseHandle(self.event) };
+        }
+    }
+}
+
+fn create_pipe_instance(pipe_path: &[u16], first_instance: bool) -> io::Result<HANDLE> {
+    let (mut security_attributes, _sd_guard) = owner_only_security_attributes()?;
+
+    let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+    if first_instance {
+        // Prevents another process from squatting this pipe name before we start.
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
     }
 
-    fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        let length = std::cmp::min(bufs.len(), u32::MAX as usize) as u32;
-        let mut nwritten = 0;
-        // SAFETY: syscall
-        let result = unsafe {
-            bindings::WSASend(
-                self.as_raw_socket() as _,
-                bufs.as_ptr().cast::<bindings::WSABUF>() as *mut _,
-                length,
-                &mut nwritten,
+    let handle = unsafe {
+        CreateNamedPipeW(
+            pipe_path.as_ptr(),
+            open_mode,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            PIPE_BUFFER_SIZE,
+            PIPE_BUFFER_SIZE,
+            0,
+            &mut security_attributes,
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(last_error());
+    }
+    Ok(handle)
+}
+
+fn start_connect(
+    handle: HANDLE,
+    overlapped: &mut Box<OVERLAPPED>,
+    event: HANDLE,
+    connected: &mut bool,
+) -> io::Result<()> {
+    *connected = false;
+    unsafe {
+        ResetEvent(event);
+        let ok = ConnectNamedPipe(handle, overlapped.as_mut() as *mut OVERLAPPED);
+        if ok != 0 {
+            // Synchronous success is unusual for overlapped so treat as immediate.
+            *connected = true;
+            SetEvent(event);
+            return Ok(());
+        }
+        let err = GetLastError();
+        match err {
+            ERROR_IO_PENDING => {}
+            ERROR_PIPE_CONNECTED => {
+                // Client connected before ConnectNamedPipe so signal manually.
+                *connected = true;
+                SetEvent(event);
+            }
+            _ => return Err(io::Error::from_raw_os_error(err as i32)),
+        }
+    }
+    Ok(())
+}
+
+/// A connected named pipe handle, used for both server-accepted connections and
+/// the client side. All I/O goes through overlapped operations so that server
+/// reads can be given a timeout.
+pub(crate) struct PipeStream {
+    handle: HANDLE,
+}
+
+unsafe impl Send for PipeStream {}
+unsafe impl Sync for PipeStream {}
+
+impl PipeStream {
+    /// Connects to `\\.\pipe\<stem(path)>` as a client.
+    pub(crate) fn connect(path: &std::path::Path) -> io::Result<Self> {
+        let pipe_path = pipe_path_from(path)?;
+
+        // WaitNamedPipeW only blocks when the pipe exists but all instances are
+        // busy. If the server hasn't created the pipe yet it returns immediately
+        // with ERROR_FILE_NOT_FOUND. Retry until the pipe appears or we time out.
+        const TOTAL_TIMEOUT_MS: DWORD = 10_000;
+        const POLL_INTERVAL_MS: DWORD = 10;
+
+        let deadline = unsafe { GetTickCount64() } + TOTAL_TIMEOUT_MS as u64;
+
+        loop {
+            let now = unsafe { GetTickCount64() };
+            let remaining_ms = deadline.saturating_sub(now).min(TOTAL_TIMEOUT_MS as u64) as DWORD;
+            if remaining_ms == 0 {
+                return Err(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32));
+            }
+
+            let ok = unsafe { WaitNamedPipeW(pipe_path.as_ptr(), remaining_ms) };
+            if ok != 0 {
+                break;
+            }
+
+            let err = unsafe { GetLastError() };
+            if err == ERROR_FILE_NOT_FOUND {
+                unsafe { Sleep(POLL_INTERVAL_MS) };
+                continue;
+            }
+
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+
+        let handle = unsafe {
+            CreateFileW(
+                pipe_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
                 0,
                 std::ptr::null_mut(),
-                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                0,
             )
         };
 
-        if result == 0 {
-            Ok(nwritten as usize)
-        } else {
-            Err(last_socket_error())
-        }
-    }
-}
-
-impl AsRawSocket for Socket {
-    fn as_raw_socket(&self) -> RawSocket {
-        self.0 as RawSocket
-    }
-}
-
-impl FromRawSocket for Socket {
-    unsafe fn from_raw_socket(sock: RawSocket) -> Self {
-        Self(sock as bindings::SOCKET)
-    }
-}
-
-impl IntoRawSocket for Socket {
-    fn into_raw_socket(self) -> RawSocket {
-        let ret = self.0 as RawSocket;
-        std::mem::forget(self);
-        ret
-    }
-}
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        // SAFETY: syscalls
-        let _ = unsafe {
-            // https://docs.microsoft.com/en-us/windows/win32/winsock/graceful-shutdown-linger-options-and-socket-closure-2
-            if bindings::shutdown(self.0, bindings::SD_SEND as i32) == 0 {
-                // Loop until we've received all data
-                let mut chunk = [0u8; 1024];
-                while let Ok(sz) = self.recv_with_flags(&mut chunk, 0) {
-                    if sz == 0 {
-                        break;
-                    }
-                }
-            }
-
-            bindings::closesocket(self.0)
-        };
-    }
-}
-
-/// A Unix domain socket server
-pub(crate) struct UnixListener(Socket);
-
-impl UnixListener {
-    pub(crate) fn bind(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
-        init();
-
-        let inner = Socket::new()?;
-        let addr = UnixSocketAddr::from_path(path.as_ref())?;
-
-        // SAFETY: syscall
-        if unsafe {
-            bindings::bind(
-                inner.as_raw_socket() as _,
-                (&addr.addr as *const sockaddr_un).cast(),
-                addr.len,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(last_error());
         }
 
-        // SAFETY: syscall
-        if unsafe {
-            bindings::listen(inner.as_raw_socket() as _, 128 /* backlog */)
-        } != 0
-        {
-            Err(last_socket_error())
-        } else {
-            Ok(Self(inner))
-        }
+        Ok(Self { handle })
     }
 
-    pub(crate) fn accept_unix_addr(&self) -> io::Result<(UnixStream, UnixSocketAddr)> {
-        let mut sock_addr = std::mem::MaybeUninit::<sockaddr_un>::uninit();
-        let mut len = std::mem::size_of::<sockaddr_un>() as i32;
-
-        let sock = self.0.accept(sock_addr.as_mut_ptr().cast(), &mut len)?;
-        // SAFETY: should have been initialized if accept succeeded
-        let addr = UnixSocketAddr::from_parts(unsafe { sock_addr.assume_init() }, len)?;
-
-        Ok((UnixStream(sock), addr))
+    /// Returns the PID of the client process connected to this server-side pipe.
+    pub(crate) fn client_pid(&self) -> io::Result<u32> {
+        let mut pid: DWORD = 0;
+        win32_ok(unsafe { GetNamedPipeClientProcessId(self.handle, &mut pid) })?;
+        Ok(pid)
     }
 
-    #[inline]
-    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.0.set_nonblocking(nonblocking)
-    }
-}
-
-impl AsRawSocket for UnixListener {
-    fn as_raw_socket(&self) -> RawSocket {
-        self.0.as_raw_socket()
-    }
-}
-
-impl AsSocket for UnixListener {
-    fn as_socket(&self) -> BorrowedSocket<'_> {
-        unsafe { BorrowedSocket::borrow_raw(self.as_raw_socket()) }
-    }
-}
-
-impl FromRawSocket for UnixListener {
-    unsafe fn from_raw_socket(sock: RawSocket) -> Self {
-        Self(Socket::from_raw_socket(sock))
-    }
-}
-
-impl IntoRawSocket for UnixListener {
-    fn into_raw_socket(self) -> RawSocket {
-        let ret = self.0.as_raw_socket();
-        std::mem::forget(self);
-        ret
-    }
-}
-
-/// A Unix doman socket stream
-pub(crate) struct UnixStream(Socket);
-
-impl UnixStream {
-    pub(crate) fn connect(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
-        init();
-
-        let inner = Socket::new()?;
-        let addr = UnixSocketAddr::from_path(path)?;
-
-        // SAFETY: syscall
-        if unsafe {
-            bindings::connect(
-                inner.as_raw_socket() as _,
-                (&addr.addr as *const sockaddr_un).cast(),
-                addr.len,
-            )
-        } != 0
-        {
-            Err(last_socket_error())
-        } else {
-            Ok(Self(inner))
-        }
-    }
-
-    #[inline]
+    /// Non-blocking peek operation that copies up to `buf.len()` bytes without consuming them.
+    #[allow(dead_code)]
     pub(crate) fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.recv_with_flags(buf, bindings::MSG_PEEK)
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut bytes_read: DWORD = 0;
+        let ok = unsafe {
+            PeekNamedPipe(
+                self.handle,
+                buf.as_mut_ptr(),
+                buf.len() as DWORD,
+                &mut bytes_read,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_BROKEN_PIPE {
+                return Ok(0);
+            }
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+        Ok(bytes_read as usize)
     }
 
-    #[inline]
+    /// Blocking read.
     pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.recv_vectored(&mut [io::IoSliceMut::new(buf)])
+        Ok(self.read_overlapped(buf, INFINITE)?.unwrap_or(0))
     }
 
-    #[inline]
+    /// Vectored, sequential read.
+    #[allow(dead_code)]
     pub(crate) fn recv_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
-        self.0.recv_vectored(bufs)
+        let mut total = 0;
+        for buf in bufs {
+            if buf.is_empty() {
+                continue;
+            }
+            match self.recv(buf) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if total > 0 => {
+                    let _ = e;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
     }
 
-    #[inline]
+    /// Read with timeout.
+    ///
+    /// `None` = timeout
+    ///
+    /// `Some(0)` = EOF
+    ///
+    /// `Some(n)` = data
+    pub(crate) fn recv_timeout_ms(
+        &self,
+        buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> io::Result<Option<usize>> {
+        self.read_overlapped(buf, timeout_ms)
+    }
+
+    /// Blocking write.
     pub(crate) fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.send_vectored(&[io::IoSlice::new(buf)])
+        self.write_overlapped(buf)
     }
 
-    #[inline]
+    /// Vectored, sequential write.
     pub(crate) fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        self.0.send_vectored(bufs)
+        let mut total = 0;
+        for buf in bufs {
+            if buf.is_empty() {
+                continue;
+            }
+            match self.send(buf) {
+                Ok(n) => total += n,
+                Err(e) if total > 0 => {
+                    let _ = e;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    }
+
+    fn read_overlapped(&self, buf: &mut [u8], timeout_ms: u32) -> io::Result<Option<usize>> {
+        if buf.is_empty() {
+            return Ok(Some(0));
+        }
+
+        let event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if event == 0 {
+            return Err(last_error());
+        }
+        struct EvGuard(HANDLE);
+        impl Drop for EvGuard {
+            fn drop(&mut self) {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+        let _ev = EvGuard(event);
+
+        let mut overlapped = OVERLAPPED {
+            Internal: 0,
+            InternalHigh: 0,
+            Offset: 0,
+            OffsetHigh: 0,
+            hEvent: event,
+        };
+        let mut bytes_read: DWORD = 0;
+
+        let ok = unsafe {
+            ReadFile(
+                self.handle,
+                buf.as_mut_ptr(),
+                buf.len() as DWORD,
+                &mut bytes_read,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            return Ok(Some(bytes_read as usize));
+        }
+
+        let err = unsafe { GetLastError() };
+        match err {
+            ERROR_IO_PENDING => {}
+            ERROR_BROKEN_PIPE => return Ok(Some(0)),
+            _ => return Err(io::Error::from_raw_os_error(err as i32)),
+        }
+
+        let wait = unsafe { WaitForSingleObject(event, timeout_ms) };
+        if wait == WAIT_TIMEOUT {
+            // Cancel and wait for cancellation to complete before overlapped goes out of scope.
+            unsafe { CancelIoEx(self.handle, &overlapped) };
+            let _ =
+                unsafe { GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_read, 1) };
+            return Ok(None);
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(last_error());
+        }
+
+        let ok = unsafe { GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_read, 0) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_BROKEN_PIPE || err == ERROR_OPERATION_ABORTED {
+                return Ok(Some(0));
+            }
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+
+        Ok(Some(bytes_read as usize))
+    }
+
+    fn write_overlapped(&self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if event == 0 {
+            return Err(last_error());
+        }
+        struct EvGuard(HANDLE);
+        impl Drop for EvGuard {
+            fn drop(&mut self) {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+        let _ev = EvGuard(event);
+
+        let mut overlapped = OVERLAPPED {
+            Internal: 0,
+            InternalHigh: 0,
+            Offset: 0,
+            OffsetHigh: 0,
+            hEvent: event,
+        };
+        let mut bytes_written: DWORD = 0;
+
+        let ok = unsafe {
+            WriteFile(
+                self.handle,
+                buf.as_ptr(),
+                buf.len() as DWORD,
+                &mut bytes_written,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            return Ok(bytes_written as usize);
+        }
+
+        let err = unsafe { GetLastError() };
+        if err != ERROR_IO_PENDING {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+
+        // Block until write completes (no timeout needed for writes).
+        win32_ok(unsafe {
+            GetOverlappedResult(self.handle, &mut overlapped, &mut bytes_written, 1)
+        })?;
+
+        Ok(bytes_written as usize)
     }
 }
 
-impl AsRawSocket for UnixStream {
-    fn as_raw_socket(&self) -> RawSocket {
-        self.0.as_raw_socket()
-    }
-}
-
-impl AsSocket for UnixStream {
-    fn as_socket(&self) -> BorrowedSocket<'_> {
-        unsafe { BorrowedSocket::borrow_raw(self.as_raw_socket()) }
-    }
-}
-
-impl FromRawSocket for UnixStream {
-    unsafe fn from_raw_socket(sock: RawSocket) -> Self {
-        Self(Socket::from_raw_socket(sock))
-    }
-}
-
-impl IntoRawSocket for UnixStream {
-    fn into_raw_socket(self) -> RawSocket {
-        let ret = self.0.as_raw_socket();
-        std::mem::forget(self);
-        ret
+impl Drop for PipeStream {
+    fn drop(&mut self) {
+        if self.handle != INVALID_HANDLE_VALUE && self.handle != 0 {
+            unsafe { CloseHandle(self.handle) };
+        }
     }
 }
