@@ -453,22 +453,25 @@ impl PipeStream {
         // WaitNamedPipeW only blocks when the pipe exists but all instances are
         // busy. If the server hasn't created the pipe yet it returns immediately
         // with ERROR_FILE_NOT_FOUND. Retry until the pipe appears or we time out.
-        const TOTAL_TIMEOUT_MS: DWORD = 5000;
+        const TOTAL_TIMEOUT_MS: DWORD = 10_000;
         const POLL_INTERVAL_MS: DWORD = 10;
 
         let deadline = unsafe { GetTickCount64() } + TOTAL_TIMEOUT_MS as u64;
 
         loop {
-            let ok = unsafe { WaitNamedPipeW(pipe_path.as_ptr(), TOTAL_TIMEOUT_MS) };
+            let now = unsafe { GetTickCount64() };
+            let remaining_ms = deadline.saturating_sub(now).min(TOTAL_TIMEOUT_MS as u64) as DWORD;
+            if remaining_ms == 0 {
+                return Err(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32));
+            }
+
+            let ok = unsafe { WaitNamedPipeW(pipe_path.as_ptr(), remaining_ms) };
             if ok != 0 {
                 break;
             }
 
             let err = unsafe { GetLastError() };
             if err == ERROR_FILE_NOT_FOUND {
-                if unsafe { GetTickCount64() } >= deadline {
-                    return Err(io::Error::from_raw_os_error(err as i32));
-                }
                 unsafe { Sleep(POLL_INTERVAL_MS) };
                 continue;
             }
