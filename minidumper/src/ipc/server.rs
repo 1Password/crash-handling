@@ -1,7 +1,13 @@
-use super::{Connection, Header, Listener, SocketName};
+#[cfg(not(target_os = "windows"))]
+use super::Connection;
+use super::{Header, Listener, SocketName};
 use crate::{Error, LoopAction};
+#[cfg(not(target_os = "windows"))]
 use polling::{Event, Poller};
-use std::io::{Cursor, ErrorKind, Write};
+use std::io::Write;
+#[cfg(not(target_os = "windows"))]
+use std::io::{Cursor, ErrorKind};
+#[cfg(not(target_os = "windows"))]
 use std::time::{Duration, Instant};
 
 /// Server side of the connection, which runs in the monitor process that is
@@ -10,19 +16,11 @@ pub struct Server {
     listener: Option<Listener>,
     #[cfg(target_os = "macos")]
     port: crash_context::ipc::Server,
-    /// For abstract sockets, we don't have to worry about cleanup as it is
-    /// handled by the OS, but on Windows and `MacOS` we need to clean them up
-    /// manually. We basically rely on the crash monitor program this Server
-    /// is running in to exit cleanly, which should be mostly true, but we
-    /// may need to harden this code if people experience issues with socket
-    /// paths not being cleaned up reliably
+    #[cfg(not(target_os = "windows"))]
     socket_path: Option<std::path::PathBuf>,
-    /// When set, dump requests must carry this token to be honored. See
-    /// [`Server::set_auth_token`].
-    #[cfg(target_os = "windows")]
-    auth_token: Option<[u8; super::AUTH_TOKEN_LEN]>,
 }
 
+#[cfg(not(target_os = "windows"))]
 struct ClientConn {
     /// The actual socket connection we established with accept
     socket: Connection,
@@ -36,6 +34,7 @@ struct ClientConn {
     pid: Option<u32>,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl ClientConn {
     fn recv(&mut self, handler: &dyn crate::ServerHandler) -> Option<(u32, Vec<u8>)> {
         use std::io::IoSliceMut;
@@ -87,20 +86,16 @@ impl Server {
     pub fn with_name<'scope>(name: impl Into<SocketName<'scope>>) -> Result<Self, Error> {
         let sn = name.into();
 
-        #[allow(irrefutable_let_patterns)]
-        let socket_path = if let SocketName::Path(path) = &sn {
-            // There seems to be a bug, at least on Windows, where checking for
-            // the existence of the file path will actually fail even if the file
-            // is actually there, so we just unconditionally remove the path
-            let _res = std::fs::remove_file(path);
-
-            Some(std::path::PathBuf::from(path))
-        } else {
-            None
-        };
-
         cfg_if::cfg_if! {
             if #[cfg(any(target_os = "linux", target_os = "android"))] {
+                #[allow(irrefutable_let_patterns)]
+                let socket_path = if let SocketName::Path(path) = &sn {
+                    let _res = std::fs::remove_file(path);
+                    Some(std::path::PathBuf::from(path))
+                } else {
+                    None
+                };
+
                 let socket_addr = match sn {
                     SocketName::Path(path) => {
                         uds::UnixSocketAddr::from_path(path).map_err(|_err| Error::InvalidName)?
@@ -114,9 +109,13 @@ impl Server {
             } else if #[cfg(target_os = "windows")] {
                 let SocketName::Path(path) = sn;
                 let listener = Listener::bind(path)?;
-                listener.set_nonblocking(true)?;
             } else if #[cfg(target_os = "macos")] {
                 let SocketName::Path(path) = sn;
+
+                let socket_path = {
+                    let _res = std::fs::remove_file(path);
+                    Some(std::path::PathBuf::from(path))
+                };
 
                 // Note that sun_path is limited to 108 characters including null,
                 // while a mach port name is limited to 128 including null, so
@@ -138,43 +137,175 @@ impl Server {
             listener: Some(listener),
             #[cfg(target_os = "macos")]
             port,
+            #[cfg(not(target_os = "windows"))]
             socket_path,
-            #[cfg(target_os = "windows")]
-            auth_token: None,
         })
-    }
-
-    /// Requires every dump request to carry the given authentication token.
-    ///
-    /// On Windows the IPC socket exposes no peer credentials so any same-user
-    /// process could otherwise connect to the socket and trigger a dump of the
-    /// monitored process. Sharing a secret token with the [`crate::Client`] over
-    /// a trusted side channel and applying it lets the server reject requests
-    /// that don't originate from the monitored process.
-    #[cfg(target_os = "windows")]
-    pub fn set_auth_token(&mut self, token: [u8; super::AUTH_TOKEN_LEN]) {
-        self.auth_token = Some(token);
     }
 
     /// Runs the server loop, accepting client connections and receiving IPC
     /// messages.
     ///
+    /// On Windows, this uses blocking named-pipe I/O with a 200 ms accept/read
+    /// timeout so the shutdown flag is polled regularly. On other platforms it
+    /// uses the `polling` crate for event-driven I/O.
+    ///
     /// If `stale_timeout` is specified, client connections that have not sent
-    /// a message within that period will be shutdown and removed, to prevent
-    /// potential issues with the server process from indefinitely outlasting
-    /// the process(es) it was monitoring for crashes, in cases where the OS
-    /// (read, Windows) might take longer than one would want to properly reap
-    /// the client connections in the event of adrupt process termination.
-    /// Sending messages will prevent the connection from going stale, but if
-    /// messages are not guaranteed to be sent at a higher frequency than your
-    /// specified timeout, you can use [`crate::Client::ping`] to fill in any
-    /// message gaps to indicate the client is still alive.
+    /// a message within that period will be shut down (non-Windows only).
     ///
     /// # Errors
     ///
-    /// This method uses basic I/O event notification via [`polling`] which
-    /// can fail for a number of different reasons
+    /// Underlying I/O errors from the OS.
     #[allow(unsafe_code)]
+    #[cfg(target_os = "windows")]
+    pub fn run(
+        &mut self,
+        handler: Box<dyn crate::ServerHandler>,
+        shutdown: &std::sync::atomic::AtomicBool,
+        _stale_timeout: Option<std::time::Duration>,
+    ) -> Result<(), Error> {
+        use std::sync::atomic::Ordering;
+
+        let mut listener = self.listener.take().unwrap();
+
+        'accept: loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            // Poll for an incoming connection every 200ms so we can check shutdown.
+            const TIMEOUT_MS: u32 = 200;
+            let conn = match listener.accept_timeout_ms(TIMEOUT_MS)? {
+                None => continue 'accept,
+                Some(c) => c,
+            };
+
+            // Verify that the connecting process is who we expect. The pipe DACL
+            // already blocks other users. This check ensures the right process
+            // within the same user session is the one connecting.
+            let client_pid = match conn.client_pid() {
+                Ok(pid) => pid,
+                Err(e) => {
+                    log::error!("GetNamedPipeClientProcessId failed: {e}");
+                    continue 'accept;
+                }
+            };
+
+            if handler.on_client_connected(1) == LoopAction::Exit {
+                return Ok(());
+            }
+
+            'messages: loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+
+                // Read the fixed-size header with a 200 ms timeout.
+                let mut hdr_buf = [0u8; std::mem::size_of::<Header>()];
+                match conn.recv_timeout_ms(&mut hdr_buf, TIMEOUT_MS)? {
+                    None => continue 'messages, // timeout — check shutdown
+                    Some(0) => break 'messages, // pipe closed
+                    Some(n) if n < hdr_buf.len() => {
+                        log::error!("dropping connection due to short header read ({n} bytes)");
+                        break 'messages;
+                    }
+                    Some(_) => {}
+                }
+
+                let header = match Header::from_bytes(&hdr_buf) {
+                    Some(h) => h,
+                    None => break 'messages,
+                };
+
+                // Read the variable-length body.
+                let mut buffer = handler.message_alloc();
+                if header.size > 0 {
+                    buffer.resize(header.size as usize, 0);
+                    let mut total = 0;
+                    while total < buffer.len() {
+                        match conn.recv_timeout_ms(&mut buffer[total..], 1000)? {
+                            None | Some(0) => break 'messages,
+                            Some(n) => total += n,
+                        }
+                    }
+                }
+
+                match header.kind {
+                    super::CRASH => {
+                        use scroll::Pread;
+                        let mut offset = 0;
+                        let dump_request: super::DumpRequest = match buffer.gread(&mut offset) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                log::error!("failed to parse dump request: {e}");
+                                break 'messages;
+                            }
+                        };
+
+                        // Verify that the process that connected is the one claiming to crash.
+                        if dump_request.process_id != client_pid {
+                            log::warn!(
+                                "rejecting dump request: PID mismatch (pipe={client_pid}, \
+                                 request={})",
+                                dump_request.process_id
+                            );
+                            break 'messages;
+                        }
+
+                        let crash_ctx = crash_context::CrashContext {
+                            exception_pointers: dump_request.exception_pointers
+                                as *const crash_context::EXCEPTION_POINTERS,
+                            process_id: dump_request.process_id,
+                            thread_id: dump_request.thread_id,
+                            exception_code: dump_request.exception_code,
+                        };
+
+                        let action = match Self::handle_crash_request(crash_ctx, handler.as_ref()) {
+                            Err(err) => {
+                                log::error!("failed to capture minidump: {err}");
+                                handler.on_minidump_created(Err(err))
+                            }
+                            Ok(action) => {
+                                log::info!("captured minidump");
+                                action
+                            }
+                        };
+
+                        let ack_header = Header {
+                            kind: super::CRASH_ACK,
+                            size: 0,
+                        };
+                        let _ = conn.send(ack_header.as_bytes());
+
+                        if action == LoopAction::Exit {
+                            return Ok(());
+                        }
+                        break 'messages;
+                    }
+                    super::PING => {
+                        let pong = Header {
+                            kind: super::PONG,
+                            size: 0,
+                        };
+                        if let Err(e) = conn.send(pong.as_bytes()) {
+                            log::error!("failed to send PONG: {e}");
+                            break 'messages;
+                        }
+                    }
+                    super::PONG => {}
+                    kind => {
+                        handler.on_message(kind - super::USER, buffer);
+                    }
+                }
+            }
+
+            if handler.on_client_disconnected(0) == LoopAction::Exit {
+                return Ok(());
+            }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    #[cfg(not(target_os = "windows"))]
     pub fn run(
         &mut self,
         handler: Box<dyn crate::ServerHandler>,
@@ -183,9 +314,6 @@ impl Server {
     ) -> Result<(), Error> {
         let mut events = polling::Events::new();
         let listener = self.listener.take().unwrap();
-
-        #[cfg(target_os = "windows")]
-        let expected_auth_token = self.auth_token;
 
         struct Poll {
             listener: Listener,
@@ -321,58 +449,24 @@ impl Server {
                                     let cc = polling.clients.swap_remove(pos);
 
                                     let crash_ctx: Option<crash_context::CrashContext>;
-                                    cfg_if::cfg_if! {
-                                        if #[cfg(any(target_os = "linux", target_os = "android"))] {
-                                            let peer_creds = cc.socket.0.initial_peer_credentials()?;
+                                    {
+                                        let peer_creds = cc.socket.0.initial_peer_credentials()?;
 
-                                            let pid = peer_creds.pid().ok_or(Error::UnknownClientPid)?;
+                                        let pid = peer_creds.pid().ok_or(Error::UnknownClientPid)?;
 
-                                            let parsed = crash_context::CrashContext::from_bytes(&buffer).ok_or_else(|| {
-                                                Error::from(std::io::Error::new(
-                                                    std::io::ErrorKind::InvalidData,
-                                                    "client sent an incorrectly sized buffer",
-                                                ))
-                                            })?;
+                                        let parsed = crash_context::CrashContext::from_bytes(&buffer).ok_or_else(|| {
+                                            Error::from(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "client sent an incorrectly sized buffer",
+                                            ))
+                                        })?;
 
-                                            // Validate that the crash info and the socket agree on the pid
-                                            if pid.get() != parsed.pid as u32 {
-                                                return Err(Error::UnknownClientPid);
-                                            }
-
-                                            crash_ctx = Some(parsed);
-                                        } else if #[cfg(target_os = "windows")] {
-                                            use scroll::Pread;
-                                            let mut offset = 0;
-                                            let dump_request: super::DumpRequest = buffer.gread(&mut offset)?;
-
-                                            let authenticated = match expected_auth_token.as_ref() {
-                                                Some(expected) => buffer
-                                                    .get(offset..offset + super::AUTH_TOKEN_LEN)
-                                                    .is_some_and(|token| constant_time_eq(token, expected)),
-                                                None => true,
-                                            };
-
-                                            if authenticated {
-                                                // MiniDumpWriteDump primarily uses `EXCEPTION_POINTERS` for its crash
-                                                // context information, but inside that is an `EXCEPTION_RECORD`, which
-                                                // is an internally linked list, so rather than recurse and allocate until
-                                                // the end of that linked list, we just retrieve the actual pointer from
-                                                // the client process, and inform the dump writer that they are pointers
-                                                // to a different process, as MiniDumpWriteDump will internally read
-                                                // the processes memory as needed
-                                                let exception_pointers = dump_request.exception_pointers as *const crash_context::EXCEPTION_POINTERS;
-
-                                                crash_ctx = Some(crash_context::CrashContext {
-                                                    exception_pointers,
-                                                    process_id: dump_request.process_id,
-                                                    thread_id: dump_request.thread_id,
-                                                    exception_code: dump_request.exception_code,
-                                                });
-                                            } else {
-                                                log::warn!("rejecting crash dump request with missing or invalid authentication token");
-                                                crash_ctx = None;
-                                            }
+                                        // Validate that the crash info and the socket agree on the pid
+                                        if pid.get() != parsed.pid as u32 {
+                                            return Err(Error::UnknownClientPid);
                                         }
+
+                                        crash_ctx = Some(parsed);
                                     }
 
                                     if let Some(crash_ctx) = crash_ctx {
@@ -593,29 +687,15 @@ impl Server {
     }
 }
 
-/// Compares two byte slices in constant time to avoid leaking the auth token
-/// through comparison timing.
-#[cfg(target_os = "windows")]
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.listener.take();
 
+        #[cfg(not(target_os = "windows"))]
         if let Some(path) = self.socket_path.take() {
             // Note we don't check for the existence of the path since there
-            // appears to be a bug on MacOS and Windows, or at least an oversight
-            // in std, where checking the existence of the path always fails
+            // appears to be a bug on MacOS, or at least an oversight in std,
+            // where checking the existence of the path always fails.
             let _res = std::fs::remove_file(path);
         }
     }

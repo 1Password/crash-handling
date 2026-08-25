@@ -12,10 +12,6 @@ pub struct Client {
     /// minidump
     #[cfg(target_os = "macos")]
     port: crash_context::ipc::Client,
-    /// Token appended to each dump request so the server can verify the request
-    /// originates from this process. See [`Client::set_auth_token`].
-    #[cfg(target_os = "windows")]
-    auth_token: Option<[u8; super::AUTH_TOKEN_LEN]>,
 }
 
 impl Client {
@@ -61,8 +57,6 @@ impl Client {
             socket,
             #[cfg(target_os = "macos")]
             port,
-            #[cfg(target_os = "windows")]
-            auth_token: None,
         };
 
         #[cfg(target_os = "macos")]
@@ -77,18 +71,6 @@ impl Client {
         }
 
         Ok(s)
-    }
-
-    /// Sets the authentication token appended to every dump request.
-    ///
-    /// On Windows the IPC socket exposes no peer credentials, so the server
-    /// cannot otherwise distinguish a dump request made by the monitored
-    /// process from one made by any other same-user process. Supplying the
-    /// same token to the server via [`crate::Server::set_auth_token`] over a
-    /// trusted side channel lets it reject unauthenticated requests.
-    #[cfg(target_os = "windows")]
-    pub fn set_auth_token(&mut self, token: [u8; super::AUTH_TOKEN_LEN]) {
-        self.auth_token = Some(token);
     }
 
     /// Requests that the server generate a minidump for the specified crash
@@ -121,9 +103,8 @@ impl Client {
                 let crash_ctx_buffer = crash_context.as_bytes();
             } else if #[cfg(target_os = "windows")] {
                 use scroll::Pwrite;
-                // Fixed-size stack buffer: the crash path must not allocate. It
-                // holds the DumpRequest followed by the optional auth token.
-                let mut buf = [0u8; 24 + super::AUTH_TOKEN_LEN];
+                // Fixed-size stack buffer: the crash path must not allocate.
+                let mut buf = [0u8; 24];
                 let mut offset = 0;
                 buf.gwrite(
                     super::DumpRequest {
@@ -134,11 +115,6 @@ impl Client {
                     },
                     &mut offset,
                 )?;
-
-                if let Some(token) = &self.auth_token {
-                    buf[offset..offset + super::AUTH_TOKEN_LEN].copy_from_slice(token);
-                    offset += super::AUTH_TOKEN_LEN;
-                }
 
                 let crash_ctx_buffer = &buf[..offset];
             } else if #[cfg(target_os = "macos")] {

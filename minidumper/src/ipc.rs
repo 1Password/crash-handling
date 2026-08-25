@@ -74,10 +74,8 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "windows")] {
         mod windows;
 
-        type Stream = windows::UnixStream;
-
-        type Listener = windows::UnixListener;
-        type Connection = windows::UnixStream;
+        type Stream = windows::PipeStream;
+        type Listener = windows::PipeListener;
 
         // This will of course break if the client and server are built for different
         // arches, but that is the fault of the user in that case
@@ -143,12 +141,6 @@ const CRASH_ACK: u32 = 1;
 const PING: u32 = 2;
 const PONG: u32 = 3;
 const USER: u32 = 4;
-
-/// Length in bytes of the authentication token used on Windows to verify that a
-/// crash dump request originates from the monitored process. See
-/// [`crate::Server::set_auth_token`].
-#[cfg(target_os = "windows")]
-pub const AUTH_TOKEN_LEN: usize = 32;
 
 /// A socket name.
 ///

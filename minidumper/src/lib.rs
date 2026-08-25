@@ -6,8 +6,6 @@ pub use errors::Error;
 use std::{fs::File, path::PathBuf};
 
 mod ipc;
-#[cfg(target_os = "windows")]
-pub use ipc::AUTH_TOKEN_LEN;
 pub use ipc::{Client, Server};
 
 /// The result of a successful minidump generation.
