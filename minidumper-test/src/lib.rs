@@ -347,7 +347,10 @@ pub fn assert_minidump(md_buf: &[u8], signal: Signal) {
                     errors::ExceptionCodeLinuxSigsegvKind::SEGV_MAPERR
                 ));
 
-                //assert_eq!(crash_address, sadness_generator::SEGFAULT_ADDRESS as _);
+                // The crash handler now translates siginfo_t -> signalfd_siginfo
+                // field-by-field, so the faulting address survives on Linux too
+                // (it was previously always 0x0). Matches the Windows/macOS arms.
+                assert_eq!(crash_address, sadness_generator::SEGFAULT_ADDRESS as _);
             }
             Signal::StackOverflow | Signal::StackOverflowCThread => {
                 // Not sure if there is a way to work around this, but on Linux it seems that a stack overflow
